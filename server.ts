@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
@@ -19,6 +20,44 @@ app.get('/api/auth-fix', (req, res) => {
   res.send('<h1>✅ تم إصلاح الاتصال!</h1><p>يمكنك الآن العودة للتطبيق وبدء الأتمتة. سيتم إغلاق هذه النافذة تلقائياً...</p><script>setTimeout(() => window.close(), 2000)</script>');
 });
 
+app.get('/api/auth-status', (req, res) => {
+  res.json({ status: 'ok', timestamp: Date.now() });
+});
+
+// Mobile-specific redirect fix
+app.get('/api/mobile-fix', (req, res) => {
+  const returnTo = (req.query.returnTo as string) || '/';
+  res.send(`
+    <html dir="rtl">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f4f7f6; text-align: center; padding: 20px; }
+          .card { background: white; padding: 30px; border-radius: 20px; shadow: 0 4px 6px rgba(0,0,0,0.1); border: 2px solid #007a33; }
+          h1 { color: #007a33; margin-bottom: 10px; }
+          p { color: #666; }
+          .loader { border: 4px solid #f3f3f3; border-top: 4px solid #007a33; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
+          @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(3600deg); } }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>✅ تم تفعيل الاتصال!</h1>
+          <p>جاري إعادتك للتطبيق الآن...</p>
+          <div class="loader"></div>
+          <a href="${returnTo}" style="display: inline-block; margin-top: 20px; padding: 10px 20px; background: #007a33; color: white; text-decoration: none; border-radius: 8px; font-size: 14px;">اضغط هنا إذا لم يتم تحويلك تلقائياً</a>
+        </div>
+        <script>
+          setTimeout(() => {
+            window.location.href = "${returnTo}";
+          }, 1500);
+        </script>
+      </body>
+    </html>
+  `);
+});
+
 // Set up multer for memory storage
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -26,11 +65,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 const tasks = new Map();
 
 app.post('/api/upload', upload.single('file'), (req, res) => {
+  console.log('[DEBUG] Received upload request');
   if (!req.file) {
+    console.log('[DEBUG] No file in request');
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
   try {
+    console.log(`[DEBUG] Parsing file: ${req.file.originalname} (${req.file.size} bytes)`);
     const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
     const sheetName = workbook.SheetNames[0];
     const sheet = workbook.Sheets[sheetName];
@@ -72,7 +114,13 @@ app.get('/api/stream/:taskId', (req, res) => {
   // Send initial state
   res.write(`data: ${JSON.stringify({ type: 'INIT', progress: task.progress, total: task.total })}\n\n`);
 
+  // Keep-alive ping every 15 seconds
+  const pingInterval = setInterval(() => {
+    res.write(':ping\n\n');
+  }, 15000);
+
   req.on('close', () => {
+    clearInterval(pingInterval);
     task.clients = task.clients.filter((client: any) => client !== res);
   });
 });
@@ -98,7 +146,24 @@ app.post('/api/start/:taskId', async (req, res) => {
 
 function broadcast(task: any, event: any) {
   const data = `data: ${JSON.stringify(event)}\n\n`;
-  task.clients.forEach((client: any) => client.write(data));
+  const disconnectedClients: any[] = [];
+  
+  task.clients.forEach((client: any) => {
+    try {
+      if (client.writable) {
+        client.write(data);
+      } else {
+        disconnectedClients.push(client);
+      }
+    } catch (err) {
+      console.error('[SSE] Failed to write to client:', err);
+      disconnectedClients.push(client);
+    }
+  });
+
+  if (disconnectedClients.length > 0) {
+    task.clients = task.clients.filter((c: any) => !disconnectedClients.includes(c));
+  }
 }
 
 function translatePlaywrightError(errorMsg: string, currentStep: string): string {
@@ -112,10 +177,18 @@ function translatePlaywrightError(errorMsg: string, currentStep: string): string
 
 async function runAutomation(taskId: string) {
   const task = tasks.get(taskId);
-  if (!task) return;
+  if (!task) {
+    console.error(`Task ${taskId} not found`);
+    return;
+  }
+
+  broadcast(task, { type: 'LOG', message: '[SYSTEM] جاري بدء تهيئة المتصفح...' });
 
   try {
-    const browser = await chromium.launch({
+    broadcast(task, { type: 'LOG', message: '[SYSTEM] جاري استدعاء chromium.launch...' });
+    
+    // Launch browser with a promise timeout
+    const launchPromise = chromium.launch({
       headless: true,
       args: [
         '--no-sandbox',
@@ -125,7 +198,18 @@ async function runAutomation(taskId: string) {
         '--no-zygote',
         '--disable-blink-features=AutomationControlled'
       ]
+    }).catch(err => {
+      console.error('[CRITICAL] Browser launch failed:', err);
+      broadcast(task, { type: 'LOG', message: `❌ فشل تشغيل المتصفح: ${err.message}` });
+      throw err;
     });
+
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('Browser launch timed out after 45s')), 45000)
+    );
+
+    const browser = await Promise.race([launchPromise, timeoutPromise]) as any;
+    broadcast(task, { type: 'LOG', message: '[SYSTEM] تم تشغيل المتصفح بنجاح.' });
 
     for (let i = 0; i < task.data.length; i++) {
       const row = task.data[i];
@@ -134,8 +218,11 @@ async function runAutomation(taskId: string) {
       broadcast(task, { type: 'LOG', message: `جاري معالجة العميل ${i + 1}: ${nationalId}...` });
 
       const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        viewport: { width: 390, height: 844 },
+        deviceScaleFactor: 3,
+        hasTouch: true,
+        isMobile: true,
         locale: 'ar-EG'
       });
 
@@ -279,6 +366,7 @@ async function runAutomation(taskId: string) {
             }
         }
 
+        // --- Step 1 Validation ---
         // Check for specific error messages like "الخدمة غير متاحة للعملاء الأجانب"
         const foreignCustomerError = await targetFrame.locator('text="الخدمة غير متاحة للعملاء الأجانب"').isVisible();
         if (foreignCustomerError) {
@@ -296,9 +384,17 @@ async function runAutomation(taskId: string) {
         if (await errorLocators.count() > 0 && await errorLocators.first().isVisible()) {
             const errText = await errorLocators.first().innerText();
             if (errText && errText.trim().length > 0) {
-                throw new Error(`رسالة خطأ من الموقع: ${errText.trim()}`);
+                throw new Error(`رسالة خطأ من الموقع في خطوة إدخال البيانات: ${errText.trim()}`);
             }
         }
+
+        // Verify transition to Step 2
+        const categoryDropdowns = targetFrame.locator('select');
+        const customCategoryDropdowns = targetFrame.locator('mat-select, .dropdown-toggle, [role="combobox"]');
+        if ((await categoryDropdowns.count() < 2) && (await customCategoryDropdowns.count() < 2)) {
+             throw new Error("لم يتم الانتقال إلى خطوة (القسم والخدمة). يرجى مراجعة البيانات المدخلة وتأكيد صحة الصفحة.");
+        }
+        // -------------------------
 
         // Step 2: Category & Service
         currentStep = 'اختيار القسم والخدمة';
@@ -376,228 +472,435 @@ async function runAutomation(taskId: string) {
         if (await nextBtn2.isVisible({ timeout: 5000 })) {
             await nextBtn2.click({ timeout: 5000 });
             await page.waitForTimeout(3000);
+        } else {
+             throw new Error(`تعذر العثور على زر التأكيد في خطوة (القسم والخدمة).`);
         }
+
+        // --- Step 2 Validation ---
+        // Verify transition to Step 3 (Branch Selection requires Governorate/Cities DDL or radio buttons)
+        const govDDL = targetFrame.locator('#GovernorateDDL, select').first();
+        const branchRadios = targetFrame.locator('input[type="radio"]');
+        if (!(await govDDL.isVisible({ timeout: 3000 }).catch(()=>false)) && (await branchRadios.count()) === 0) {
+             throw new Error(`فشل الانتقال إلى خطوة (اختيار الفرع). القسم أو الخدمة غير متاحة حالياً أو يوجد خطأ بالموقع.`);
+        }
+        // -------------------------
 
         // Step 3: Branch Selection
         currentStep = 'اختيار الفرع';
-        broadcast(task, { type: 'LOG', message: `الخطوة 3: اختيار الفرع...` });
+        broadcast(task, { type: 'LOG', message: `الخطوة 3: اختيار الفرع (القاهرة -> مدينة نصر -> عباس العقاد)...` });
         
-        await page.waitForTimeout(2000); // Wait for the new page to load
+        await page.waitForTimeout(3000); 
         
+        // Hide chatbot
+        await page.addStyleTag({ content: '.chatbot-container, [id^="chatbot"], [class^="chatbot"], .messenger-launcher, #watson-chat-container { display: none !important; }' }).catch(() => {});
+
+        let branchClicked = false;
         try {
-            // DEBUG: Print available selects and inputs for Step 3
-            const step3Selects = await targetFrame.locator('select').evaluateAll((els: HTMLSelectElement[]) => els.map(e => ({ id: e.id, name: e.name, options: Array.from(e.options).map(o => o.text.trim()) })));
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Step 3 Selects: ${JSON.stringify(step3Selects)}` });
+            // 1. Precise Governorate & Region Selection (Targets: #GovernorateDDL, #CitiesDDL)
+            const govSelect = targetFrame.locator('#GovernorateDDL, select').first();
+            const regSelect = targetFrame.locator('#CitiesDDL, select').nth(1);
             
-            const step3Radios = await targetFrame.locator('input[type="radio"]').evaluateAll((els: HTMLInputElement[]) => els.map(e => ({ id: e.id, value: e.value, name: e.name })));
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Step 3 Radios: ${JSON.stringify(step3Radios)}` });
+            // Select Cairo (القاهرة)
+            const targetGov = governorate || 'القاهرة';
+            await govSelect.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
             
-            const branchDropdowns = targetFrame.locator('select');
-            if (await branchDropdowns.count() > 0) {
-                // 1. Select "Search all branches" in the Governorate dropdown
-                const govSelect = branchDropdowns.nth(0);
-                const govOptionsHandle = await govSelect.elementHandle();
-                const govOptions = govOptionsHandle ? await govOptionsHandle.$$eval('option', opts => opts.map(o => ({ value: o.value, text: o.textContent?.trim() || '' }))) : [];
-                
-                const searchAllOption = govOptions.find(o => o.text.includes('بحث في كافة') || o.text.includes('بحث'));
-                if (searchAllOption && searchAllOption.value) {
-                    await govSelect.selectOption(searchAllOption.value);
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم تعيين المحافظة إلى: ${searchAllOption.text}` });
-                    await page.waitForTimeout(2000); // Wait for UI to update
-                }
+            const govOptions = await govSelect.locator('option').evaluateAll((opts: HTMLOptionElement[]) => opts.map(o => ({ value: o.value, text: o.textContent?.trim() || '' })));
+            const matchedGov = govOptions.find(o => o.text.includes(targetGov) || targetGov.includes(o.text));
+            
+            if (matchedGov) {
+                await govSelect.selectOption(matchedGov.value);
+                await govSelect.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
+                broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار المحافظة: ${matchedGov.text}` });
             }
 
-            // 2. Type Branch name directly into the search input
-            // The search box usually has a specific placeholder or is the last text input before radios
-            const searchInputLocator = targetFrame.locator('input[type="text"]:not([readonly])').last();
+            // Waiting for Region (مدينة نصر) - Essential for Select2/Dynamic load
+            broadcast(task, { type: 'LOG', message: `[PROCESS] جاري انتظار تفعيل قائمة المنطقة...` });
             
-            const cleanSearchQuery = branch.replace('فرع ', '').replace('الرئيسي', '').trim();
-            const normalizedBranchToFind = cleanSearchQuery; // No aggressive stripping here
-
-            if (await searchInputLocator.count() > 0 && await searchInputLocator.isVisible()) {
-                await searchInputLocator.fill(cleanSearchQuery);
-                await searchInputLocator.press('Enter'); // Trigger any listeners bound to Enter
-                broadcast(task, { type: 'LOG', message: `[PROCESS] تم كتابة اسم الفرع للبحث: ${cleanSearchQuery}` });
-                await page.waitForTimeout(3000); // Wait for the list to filter
-            } else {
-                 broadcast(task, { type: 'LOG', message: `[DEBUG] لم يتم العثور على حقل بحث نشط للفرع، سيتم البحث في القائمة الحالية.` });
-            }
-
-            // 3. Select Branch (Radio buttons)
-            const branchLabels = targetFrame.locator('label');
-            const labelTexts = await branchLabels.allInnerTexts();
-            
-            let branchClicked = false;
-            // Iterate and find matching label
-            for (let i = 0; i < await branchLabels.count(); i++) {
-                const text = labelTexts[i];
-                if (!text) continue;
-                
-                // Flexible Match: Check if the text matches the raw user string, or the normalized query
-                const textClean = text.trim();
-                const matches = textClean.includes(branch.trim()) || 
-                                textClean.includes(cleanSearchQuery) || 
-                                cleanSearchQuery.includes(textClean);
-                                
-                if (matches) {
-                    await branchLabels.nth(i).click();
-                    branchClicked = true;
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار الفرع المطابق: ${textClean}` });
+            let isRegReady = false;
+            for(let i=0; i<30; i++) { // Up to 30s as per video behavior
+                const isDisabled = await regSelect.evaluate((el: HTMLSelectElement) => el.disabled);
+                const optionsCount = await regSelect.locator('option').count();
+                if (!isDisabled && optionsCount > 1) {
+                    isRegReady = true;
                     break;
                 }
+                await page.waitForTimeout(1000);
             }
-            
-            if (!branchClicked) {
-                // Fallback: click the first radio button if it exists
-                const firstRadio = targetFrame.locator('input[type="radio"]').first();
-                if (await firstRadio.isVisible()) {
-                    await firstRadio.click({ force: true });
-                    branchClicked = true;
-                    broadcast(task, { type: 'LOG', message: `[WARNING] تم اختيار أول فرع متاح في نتائج البحث كبديل.` });
+
+            if (isRegReady) {
+                const targetReg = region || 'مدينة نصر';
+                const regOptions = await regSelect.locator('option').evaluateAll((opts: HTMLOptionElement[]) => opts.map(o => ({ value: o.value, text: o.textContent?.trim() || '' })));
+                const matchedReg = regOptions.find(o => o.text.includes(targetReg) || targetReg.includes(o.text));
+                if (matchedReg) {
+                    await regSelect.selectOption(matchedReg.value);
+                    await regSelect.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
+                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار المنطقة: ${matchedReg.text}` });
+                    await page.waitForTimeout(3000); // Wait for branches to appear
                 }
             }
-            
-            if (!branchClicked) {
-                 broadcast(task, { type: 'LOG', message: `[WARNING] لم يظهر أي فرع متاح لتحديده.` });
+
+            // 2. Branch Search Input (Optional but helpful for filtering)
+            const searchInput = targetFrame.locator('input[type="text"]:not([readonly]), input[placeholder*="الفرع"]').last();
+            const branchSearchTerm = branch.replace('فرع ', '').replace('الرئيسي', '').trim() || 'عباس العقاد';
+
+            if (await searchInput.isVisible({ timeout: 5000 })) {
+                await searchInput.fill(branchSearchTerm);
+                await searchInput.press('Enter');
+                broadcast(task, { type: 'LOG', message: `[PROCESS] تم البحث عن الفرع...` });
+                await page.waitForTimeout(3000); 
             }
+
+            // 3. Selection of Radio Button
+            broadcast(task, { type: 'LOG', message: `[PROCESS] جاري انتظار ورصد الفروع في الصفحة...` });
             
+            const radiosLocator = targetFrame.locator('input[type="radio"]');
+            
+            // Wait for at least one radio button to attach
+            let radiosAvailable = false;
+            try {
+                await radiosLocator.first().waitFor({ state: 'attached', timeout: 8000 });
+                radiosAvailable = true;
+            } catch (e) {
+                broadcast(task, { type: 'LOG', message: `⚠️ وقت انتظار الفروع انتهى.` });
+            }
+
+            if (radiosAvailable) {
+                const count = await radiosLocator.count();
+                broadcast(task, { type: 'LOG', message: `[PROCESS] تم رصد ${count} خيارات بالبرمجة.` });
+                
+                const normalize = (s: string) => s.replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/\s+/g, '').trim();
+                const targetNorm = normalize(branchSearchTerm);
+                
+                // Tier 1: Try specific match
+                for (let i = 0; i < count; i++) {
+                    const radio = radiosLocator.nth(i);
+                    const parentText = await radio.locator('xpath=..').innerText().catch(() => '') || '';
+                    const grandParentText = await radio.locator('xpath=../..').innerText().catch(() => '') || '';
+                    const combinedText = parentText + ' ' + grandParentText;
+                    
+                    if (normalize(combinedText).includes(targetNorm) || (branch.includes('073') && combinedText.includes('073'))) {
+                        await radio.click({ force: true }).catch(() => {});
+                        await radio.evaluate((el: HTMLInputElement) => {
+                            el.checked = true;
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                            el.dispatchEvent(new Event('click', { bubbles: true }));
+                        }).catch(() => {});
+                        
+                        branchClicked = true;
+                        broadcast(task, { type: 'LOG', message: `✅ تم العثور على الفرع المطلوب واختياره.` });
+                        break;
+                    }
+                }
+
+                // Tier 2: Fallback to first available using locators
+                if (!branchClicked) {
+                    broadcast(task, { type: 'LOG', message: `⚠️ لم يُطابق الاسم أي فرع، جاري إجبار اختيار أول فرع...` });
+                    const firstRadio = radiosLocator.first();
+                    await firstRadio.click({ force: true }).catch(() => {});
+                    await firstRadio.evaluate((el: HTMLInputElement) => {
+                        el.checked = true;
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('click', { bubbles: true }));
+                    }).catch(() => {});
+                    
+                    branchClicked = true;
+                    broadcast(task, { type: 'LOG', message: `✅ تم إجبار اختيار الفرع الأول.` });
+                }
+            } else {
+                // Tier 3: Extreme fallback JS evaluation without offsetParent restriction
+                broadcast(task, { type: 'LOG', message: `⚠️ محاولة أخيرة عبر حقن سكربت (JS) للبحث عن الدوائر...` });
+                const frames = page.frames();
+                for (const f of frames) {
+                    try {
+                        const anyRadioFound = await f.evaluate(() => {
+                            const allRadios = Array.from(document.querySelectorAll('input[type="radio"]')) as HTMLInputElement[];
+                            if (allRadios.length > 0) {
+                                allRadios[0].checked = true;
+                                allRadios[0].click();
+                                allRadios[0].dispatchEvent(new Event('change', { bubbles: true }));
+                                return true;
+                            }
+                            return false;
+                        }).catch(() => false);
+
+                        if (anyRadioFound) {
+                            branchClicked = true;
+                            broadcast(task, { type: 'LOG', message: `✅ نجحت المحاولة الأخيرة بالتحديد عبر السكربت.` });
+                            break;
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            if (!branchClicked) {
+                broadcast(task, { type: 'LOG', message: `⚠️ لم يتم العثور على أي فروع متاحة للاختيار. سيتم المحاولة بالضغط على "تنفيذ" للتحقق.` });
+            }
+
+            await page.waitForTimeout(1500);
         } catch (err) {
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Error in Step 3: ${err}` });
+            broadcast(task, { type: 'LOG', message: `[DEBUG] Error in Step 3 selection: ${err}` });
         }
-
+        
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد اختيار الفرع', isError: false });
+        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'الحالة قبل الضغط على تنفيذ', isError: false });
 
-        const nextBtn3 = targetFrame.locator('#Submit_btn, input[type="submit"], button:has-text("تنفيذ"), button:has-text("التالي"), button:has-text("Next"), button:has-text("استمرار")').first();
+        const nextBtn3 = targetFrame.locator('button:has-text("تنفيذ"), #Submit_btn, input[type="submit"]').first();
         if (await nextBtn3.isVisible({ timeout: 5000 })) {
-            await nextBtn3.click({ timeout: 5000 });
+            broadcast(task, { type: 'LOG', message: `[PROCESS] الضغط على زر "تنفيذ"...` });
+            await nextBtn3.click({ force: true });
+            
+            // Step 3 Validation: "Required" appears AFTER clicking if selection failed, OR we don't transition to Time selection
             await page.waitForTimeout(3000);
+            const isRequiredVisible = await targetFrame.locator('text=مطلوب').isVisible({ timeout: 2000 }).catch(() => false);
+            
+            if (isRequiredVisible) {
+                const errorShot = await page.screenshot({ type: 'jpeg', quality: 80 });
+                broadcast(task, { type: 'SCREENSHOT', image: errorShot.toString('base64'), caption: 'خطأ: لم يتم اختيار الفرع', isError: true });
+                throw new Error(`فشل تجاوز الفرع: رسالة "مطلوب" ظهرت. يبدو أن الفرع مغلق أو لا يوجد مواعيد.`);
+            }
+
+            // Check if we reached step 4 (Date/Time selects appeared)
+            const isStep4Reached = await targetFrame.locator('select').count() >= 1 || await targetFrame.locator('input[type="radio"]').count() >= 1 || await targetFrame.locator('.date-picker, input[type="date"]').isVisible({timeout:2000}).catch(()=>false);
+            if (!isStep4Reached) {
+                throw new Error(`فشل الانتقال إلى المواعيد بعد تأكيد الفرع. قد تكون الفروع ممتلئة تماماً لهذا اليوم.`);
+            }
+
+            broadcast(task, { type: 'LOG', message: `[SUCCESS] تم تجاوز مرحلة اختيار الفرع بنجاح.` });
+        } else {
+            throw new Error(`توقف العملية: لم يتم العثور على زر "تنفيذ" بعد تحديد الفرع.`);
         }
 
         // Step 4: Date & Time
         currentStep = 'اختيار الموعد والتوقيت';
         broadcast(task, { type: 'LOG', message: `الخطوة 4: اختيار الموعد والتوقيت...` });
         
-        await page.waitForTimeout(2000); // Wait for page to load
-        
         try {
-            // Based on screenshots, Date and Time are standard <select> elements
-            const dateTimeDropdowns = targetFrame.locator('select');
+            // First: attempt to locate a dropdown (Legacy/Current structure)
+            const selects = targetFrame.locator('select');
+            const count = await selects.count().catch(() => 0);
             
-            if (await dateTimeDropdowns.count() >= 2) {
-                // 1. Select Date
-                const dateSelect = dateTimeDropdowns.nth(0);
-                const dateOptionsHandle = await dateSelect.elementHandle();
-                const dateOptions = dateOptionsHandle ? await dateOptionsHandle.$$eval('option', opts => opts.map(o => ({ value: o.value, text: o.textContent?.trim() || '' }))) : [];
-                
-                // Select first valid date
-                const validDate = dateOptions.find(o => o.value && o.text.trim() !== '' && !o.text.includes('اختر'));
-                if (validDate) {
-                    await dateSelect.selectOption(validDate.value);
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار اليوم: ${validDate.text}` });
-                    await page.waitForTimeout(3000); // Wait for times to load based on selected date
-                } else {
-                    broadcast(task, { type: 'LOG', message: `[WARNING] لم يتم العثور على أيام متاحة للحجز.` });
-                }
+            // Second: attempt to locate radio-buttons for dates/times (New structure shown in video)
+            const dateRadios = targetFrame.locator('input[type="radio"], .radio-button');
+            const radioCount = await dateRadios.count().catch(() => 0);
 
-                // 2. Select Time
-                const timeSelect = dateTimeDropdowns.nth(1);
-                const timeOptionsHandle = await timeSelect.elementHandle();
-                const timeOptions = timeOptionsHandle ? await timeOptionsHandle.$$eval('option', opts => opts.map(o => ({ value: o.value, text: o.textContent?.trim() || '' }))) : [];
+            if (count > 0) {
+                 await selects.first().waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
+                 let daySelect = null;
+                 let timeSelect = null;
+                 
+                 for(let i=0; i<count; i++) {
+                     const label = await selects.nth(i).evaluate(el => {
+                        const lbl = document.querySelector(`label[for="${el.id}"]`);
+                        return lbl ? lbl.textContent?.trim() : '';
+                     }).catch(() => '');
+                     const options = await selects.nth(i).locator('option').allInnerTexts();
+                     const optionsStr = options.join(' ');
+     
+                     if (label?.includes('يوم') || optionsStr.includes('202') || (optionsStr.includes('-') && optionsStr.length > 5)) {
+                         if (!daySelect) daySelect = selects.nth(i);
+                     } else if (label?.includes('توقيت') || optionsStr.includes(':') || optionsStr.includes('صباح') || optionsStr.includes('مساء')) {
+                         if (!timeSelect) timeSelect = selects.nth(i);
+                     }
+                 }
+                 
+                 if (!daySelect && count >= 1) daySelect = selects.nth(0);
+                 if (!timeSelect && count >= 2) timeSelect = selects.nth(1);
+     
+                 if (daySelect) {
+                     const opts = await daySelect.locator('option').evaluateAll((os: HTMLOptionElement[]) => os.filter(o => o.value && !['', '0'].includes(o.value) && !o.textContent?.includes('اختر')).map(o => o.value));
+                     if (opts.length > 0) {
+                         await daySelect.selectOption(opts[0]);
+                         broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار اليوم بنجاح.` });
+                         await page.waitForTimeout(3000); // Allow time to fetch times
+                     }
+                 }
+                 
+                 if (timeSelect) {
+                     const opts = await timeSelect.locator('option').evaluateAll((os: HTMLOptionElement[]) => os.filter(o => o.value && !['', '0'].includes(o.value) && !o.textContent?.includes('اختر')).map(o => o.value));
+                     if (opts.length > 0) {
+                         await timeSelect.selectOption(opts[0]);
+                         broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت بنجاح.` });
+                         await page.waitForTimeout(2000);
+                     }
+                 }
+            } else if (radioCount > 0) {
+                // Video pattern: List of dates as radio buttons, click first available
+                broadcast(task, { type: 'LOG', message: `[PROCESS] تم العثور على تواريخ بنظام الأزرار (Radios)، اختيار الأول...` });
+                await dateRadios.first().click({ force: true });
+                await page.waitForTimeout(2000); // Sometimes picking a date reveals time buttons
                 
-                // Select first valid time
-                const validTime = timeOptions.find(o => o.value && o.text.trim() !== '' && !o.text.includes('اختر'));
-                if (validTime) {
-                    await timeSelect.selectOption(validTime.value);
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت: ${validTime.text}` });
-                    await page.waitForTimeout(2000); // Brief wait after selection
-                } else {
-                    broadcast(task, { type: 'LOG', message: `[WARNING] لم يتم العثور على توقيت متاح.` });
+                // See if times appeared below it as radios again
+                const timeRadios = targetFrame.locator('input[type="radio"], .radio-button'); // Refetch
+                if (await timeRadios.count() > 1 && await timeRadios.nth(1).isVisible()) {
+                      await timeRadios.nth(1).click({ force: true }).catch(() => {});
+                      broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت من أزرار الأوقات.` });
+                      await page.waitForTimeout(2000);
                 }
             } else {
-                 broadcast(task, { type: 'LOG', message: `[DEBUG] Select dropdowns not found in Step 4. Fallback logic skipped.` });
+                 broadcast(task, { type: 'LOG', message: `⚠️ لم يتم رصد أي قوائم أو أزرار تواريخ.` });
             }
-        } catch (err) {
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Error in Step 4: ${err}` });
+        } catch (e) {
+            broadcast(task, { type: 'LOG', message: `[DEBUG] Error Step 4: ${e}` });
         }
 
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
         broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد اختيار الموعد', isError: false });
 
-        const nextBtn4 = targetFrame.locator('#Submit_btn, input[type="submit"], button:has-text("تنفيذ"), button:has-text("التالي"), button:has-text("Next"), button:has-text("استمرار"), button:has-text("تأكيد")').first();
-        if (await nextBtn4.isVisible({ timeout: 5000 })) {
-            await nextBtn4.click({ timeout: 5000 });
+        const confirmBtn = targetFrame.locator('button:has-text("تنفيذ"), #Submit_btn, input[type="submit"]').first();
+        if (await confirmBtn.isVisible({ timeout: 5000 })) {
+            await confirmBtn.click({ force: true });
+        } else {
+             throw new Error(`تعذر العثور على زر تأكيد الحجز النهائي بعد اختيار الموعد.`);
         }
         
+        // --- Step 4 Validation ---
+        await page.waitForTimeout(4000); 
+        // Re-acquire frame in case it reloaded after submission
+        targetFrame = page.frames().find(f => f.name() === 'myIFrm') || page.mainFrame();
+
+        const successIndicators = targetFrame.locator('button:has-text("Download"), button:has-text("تحميل"), a:has-text("تحميل"), .download, :has-text("تعديل الحجز"), :has-text("الغاء الحجز"), .ticket, .modal-content, .alert-success').first();
+        const isSuccess = await successIndicators.isVisible({ timeout: 5000 }).catch(() => false) || await targetFrame.locator('text=Download').count() > 0 || await targetFrame.locator('text=تحميل').count() > 0;
+
+        if (!isSuccess) {
+            // Check if there's a soft error displayed on screen
+            const dateError = await targetFrame.locator('text=غير متاح, text=عفوا, .alert').isVisible({timeout: 2000}).catch(()=>false);
+            if (dateError) {
+                throw new Error(`فشل تأكيد الحجز: الموقع رفض الموعد أو اليوم غير متاح الآن.`);
+            } else {
+                throw new Error(`فشل تأكيد الموعد النهائي: الصفحة لم تظهر التذكرة بعد الضغط على تنفيذ.`);
+            }
+        }
+        // -------------------------
+
         // Step 5: Confirmation Ticket
         currentStep = 'تأكيد الحجز واستخراج التذكرة';
         broadcast(task, { type: 'LOG', message: `الخطوة 5: جاري تأكيد الحجز واستخراج التذكرة...` });
-        await page.waitForTimeout(4000); // Wait for confirmation page
         
-        // Take a full-page screenshot of the final state right away
+        // Wait explicitly for the final elements to appear
+        await page.waitForTimeout(4000); 
+
+        // Re-acquire frame in case it reloaded after submission
+        targetFrame = page.frames().find(f => f.name() === 'myIFrm') || page.mainFrame();
+
+        // Take a full-page screenshot of the final state right away for debug logs (NOT flagged as ticket)
         const successScreenshot = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: true });
         broadcast(task, { 
           type: 'SCREENSHOT', 
           image: successScreenshot.toString('base64'), 
-          caption: `النتيجة النهائية - ${nationalId}`,
+          caption: `النتيجة النهائية (لقطة الشاشة كاملة) - ${nationalId}`,
           isError: false
         });
 
-        // Verify success by checking for key elements on the final screen (e.g., Download, Cancel, Edit)
-        const successIndicators = targetFrame.locator('button:has-text("Download"), a:has-text("Download"), :has-text("تعديل الحجز"), :has-text("الغاء الحجز")');
-        const isSuccess = await successIndicators.count() > 0;
-
-        if (isSuccess) {
-            status = 'ناجح';
-            note = 'تم الحجز بنجاح وتم التقاط التذكرة';
-            
-            try {
-                // Find and click the download button
-                const downloadBtn = targetFrame.locator('button:has-text("Download"), :text-is("Download"), .download').first();
-                if (await downloadBtn.isVisible({ timeout: 3000 })) {
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم العثور على زر Download، جاري التحميل...` });
-                    
-                    // Race between download event and a timeout (some JS downloads don't trigger the standard browser download event)
-                    const downloadPromise = page.waitForEvent('download', { timeout: 8000 }).catch(() => null);
-                    await downloadBtn.click({ force: true });
-                    const downloadMessage = await downloadPromise;
-                    
-                    if (downloadMessage) {
-                        const downloadPath = await downloadMessage.path();
-                        const fs = require('fs');
-                        const fileBuffer = fs.readFileSync(downloadPath);
-                        const base64Data = fileBuffer.toString('base64');
-                        
-                        broadcast(task, { 
-                            type: 'SCREENSHOT', 
-                            image: base64Data, 
-                            caption: `📥 ملف التذكرة (الرقم القومي: ${nationalId})`,
-                            isError: false
-                        });
-                        broadcast(task, { type: 'LOG', message: `[SUCCESS] تم حفظ ملف التذكرة بنجاح.` });
-                    } else {
-                        // Fallback: take a targeted screenshot of the ticket area if Download event didn't fire
-                        broadcast(task, { type: 'LOG', message: `[DEBUG] التنزيل المباشر كملف لم يعمل، جاري التقاط التذكرة كصورة مقصوصة...` });
-                        const ticketLocator = targetFrame.locator('.modal-content, .modal-dialog, div').filter({ hasText: 'Download' }).filter({ hasText: 'البنك' }).last();
-                        
-                        if (await ticketLocator.isVisible()) {
-                            const ticketShot = await ticketLocator.screenshot({ type: 'jpeg', quality: 90 });
-                            broadcast(task, { 
-                                type: 'SCREENSHOT', 
-                                image: ticketShot.toString('base64'), 
-                                caption: `📸 لقطة مقصوصة للتذكرة (الرقم القومي: ${nationalId})`,
-                                isError: false
-                            });
+        // If we reached here, Step 4 validation passed, so it IS a success.
+        status = 'ناجح';
+        note = 'تم الحجز بنجاح وتم التقاط التذكرة';
+        
+        try {
+            // 1. Take a clean, targeted screenshot of the ticket modal itself
+            broadcast(task, { type: 'LOG', message: `[PROCESS] محاولة العثور على التذكرة لقصها (بالبحث التسلقي)...` });
+                
+                const findTicketLogic = () => {
+                    // Look for common text nodes strictly inside the ticket
+                    const allElems = Array.from(document.querySelectorAll('*'));
+                    let seedNode = null;
+                    for (const el of allElems) {
+                        if (el.children.length === 0 && el.textContent) {
+                            if (el.textContent.includes('15') || el.textContent.includes('دقيقة') || el.textContent.includes('الفرع') || el.textContent.includes('التواجد') || el.textContent.includes('QR')) {
+                                seedNode = el;
+                                break;
+                            }
                         }
                     }
+                    
+                    // Climb the DOM tree from the text node until we find a reasonably sized graphical box
+                    let container = seedNode;
+                    while (container && container !== document.body && container !== document.documentElement) {
+                        const rect = container.getBoundingClientRect();
+                        const style = window.getComputedStyle(container);
+                        const isModal = typeof container.className === 'string' && (container.className.includes('modal-content') || container.className.includes('modal-dialog') || container.className.includes('ticket'));
+                        
+                        // Ticket sizes usually range from 200px to 800px width/height and have a non-transparent background
+                        if (rect.height >= 200 && rect.width >= 250 && rect.width <= 1000) {
+                            if (isModal || container.id === 'printDIV' || container.id === 'ticket' || (style.backgroundColor && style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')) {
+                                container.id = 'nbe-auto-ticket-target';
+                                return '#nbe-auto-ticket-target';
+                            }
+                        }
+                        container = container.parentElement;
+                    }
+
+                    // Static fallbacks
+                    const m1 = document.querySelector('.modal-content, .modal-dialog');
+                    if (m1) { m1.id = 'nbe-auto-ticket-target'; return '#nbe-auto-ticket-target'; }
+
+                    const m2 = document.querySelector('#printDIV');
+                    if (m2) { m2.id = 'nbe-auto-ticket-target'; return '#nbe-auto-ticket-target'; }
+
+                    return null;
+                };
+
+                let ticketShotBase64 = null;
+
+                try {
+                    // Try to find the ticket box inside the iframe first
+                    let foundSelector = await targetFrame.evaluate(findTicketLogic).catch(() => null);
+                    let finalLocator = foundSelector ? targetFrame.locator(foundSelector) : null;
+                    
+                    // If not found in iframe, try finding it in the main page (sometimes popups jump out of iframes)
+                    if (!finalLocator) {
+                        foundSelector = await page.evaluate(findTicketLogic).catch(() => null);
+                        finalLocator = foundSelector ? page.locator(foundSelector) : null;
+                    }
+
+                    if (finalLocator) {
+                        try {
+                            // Fetch dimensions bypassing scroll algorithms. boundingBox() automatically handles iframe offsets!
+                            const box = await finalLocator.boundingBox({ timeout: 5000 });
+                            
+                            if (box && box.width > 0 && box.height > 0) {
+                                // Clamp the viewport to ensure the area is fully visible, but without triggering explicit scroll actions on the element
+                                ticketShotBase64 = (await page.screenshot({ 
+                                    type: 'jpeg', 
+                                    quality: 60,
+                                    clip: { x: box.x, y: box.y, width: box.width, height: box.height},
+                                    timeout: 10000
+                                })).toString('base64');
+                            } else {
+                                throw new Error("Bounding box null or zero");
+                            }
+                        } catch (e: any) {
+                             broadcast(task, { type: 'LOG', message: `[DEBUG] فشل القص الدقيق (${e.message})، سيتم محاولة حفظ المشهد المعروض.` });
+                             // If completely detached, try blindly capturing without checks, failing fast if needed
+                             ticketShotBase64 = (await page.screenshot({ type: 'jpeg', quality: 90 })).toString('base64');
+                        }
+                    }
+                } catch (shotErr: any) {
+                    broadcast(task, { type: 'LOG', message: `[DEBUG] حدث خطأ أثناء قص الصورة: ${shotErr.message}` });
                 }
-            } catch (downloadErr) {
-                broadcast(task, { type: 'LOG', message: `[DEBUG] تعذر حفظ التذكرة بشكل منفصل: ${downloadErr}` });
+
+                if (ticketShotBase64) {
+                    broadcast(task, { 
+                        type: 'SCREENSHOT', 
+                        image: ticketShotBase64, 
+                        caption: `تذكرة العميل: ${nationalId}`,
+                        isError: false,
+                        isTicket: true // <--- sends only the clean cropped ticket to the gallery
+                    });
+                } else {
+                    broadcast(task, { type: 'LOG', message: `⚠️ لم يتم العثور على الإطار الأبيض للتذكرة لقصها!` });
+                }
+
+                // 2. Click Download button if present
+                const downloadBtn = targetFrame.locator('button:has-text("Download"), a:has-text("Download"), .download, button:has-text("تحميل"), a:has-text("تحميل")').first();
+                if (await downloadBtn.isVisible({ timeout: 3000 })) {
+                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم العثور على زر التنزيل، جاري الضغط عليه...` });
+                    await downloadBtn.click({ force: true }).catch(() => {});
+                    broadcast(task, { type: 'LOG', message: `✅ تم الضغط على زر التنزيل بنجاح.` });
+                    await page.waitForTimeout(3000); // Give it time to trigger
+                }
+            } catch (ticketErr) {
+                broadcast(task, { type: 'LOG', message: `[DEBUG] اكتمل الحجز ولكن واجهنا التأخير في تصوير التذكرة: ${ticketErr}` });
             }
-        } else {
-            status = 'مجهول (تحقق من الصورة)';
-            note = 'لم يتم تأكيد النجاح صراحةً، يرجى مراجعة الصورة النهائية';
-        }
       } catch (error: any) {
         const rawError = error.message || 'Error occurred';
         const friendlyError = translatePlaywrightError(rawError, currentStep);
@@ -668,5 +971,14 @@ async function startServer() {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }
+
+// Global error handling for unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
 
 startServer();
