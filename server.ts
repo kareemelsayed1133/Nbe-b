@@ -14,6 +14,7 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Auth fix endpoint
 app.get('/api/auth-fix', (req, res) => {
