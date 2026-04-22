@@ -19,6 +19,7 @@ export default function App() {
   const [selectedScreenshotIndex, setSelectedScreenshotIndex] = useState<number>(0);
   const [results, setResults] = useState<any[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [selectedScreenshotForModal, setSelectedScreenshotForModal] = useState<any>(null);
   
   // Generator State
   const [genGov, setGenGov] = useState<string>('القاهرة');
@@ -516,6 +517,20 @@ export default function App() {
       {/* Main Content */}
       <div className="flex-1 flex flex-col p-4 md:p-6 gap-4 md:gap-5 overflow-y-auto pb-24 md:pb-6 relative w-full">
         
+        {/* Screenshot Modal */}
+        {selectedScreenshotForModal && (
+          <div 
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
+            onClick={() => setSelectedScreenshotForModal(null)}
+          >
+            <div className="bg-slate-900 rounded-lg p-4 max-w-2xl w-full border border-slate-700 relative" onClick={(e) => e.stopPropagation()}>
+              <button className="text-white absolute top-2 right-2 p-2" onClick={() => setSelectedScreenshotForModal(null)}>X</button>
+              <img src={`data:image/jpeg;base64,${selectedScreenshotForModal.image}`} className="w-full" />
+              <p className="text-white mt-2">{selectedScreenshotForModal.caption}</p>
+            </div>
+          </div>
+        )}
+
         {/* Header */}
         <div className="flex flex-col sm:flex-row justify-between sm:items-center bg-white py-3 md:py-4 px-4 md:px-6 rounded-xl shadow-sm border border-slate-200 shrink-0 gap-3">
           <div className="flex items-center justify-between w-full sm:w-auto">
@@ -744,7 +759,8 @@ export default function App() {
               <div ref={logsEndRef} />
             </div>
 
-            <div className="w-full h-[180px] bg-slate-900 rounded-lg mt-3 relative overflow-hidden flex items-center justify-center border border-slate-700">
+            <div className="w-full h-[180px] bg-slate-900 rounded-lg mt-3 relative overflow-hidden flex items-center justify-center border border-slate-700 cursor-pointer hover:border-slate-500 transition-colors"
+                 onClick={() => screenshots.length > 0 && setSelectedScreenshotForModal(screenshots[selectedScreenshotIndex])}>
               <span className="absolute top-1.5 right-2 text-[9px] bg-black/60 text-white px-1.5 py-0.5 rounded z-10 max-w-[90%] truncate">
                 {screenshots.length > 0 ? screenshots[selectedScreenshotIndex]?.caption : 'Debug View'}
               </span>
@@ -760,6 +776,9 @@ export default function App() {
                   IMAGE_RECOVERY_MODE_ACTIVE
                 </div>
               )}
+              <div className="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 bg-black/50 transition-opacity">
+                <span className="text-white text-xs font-bold flex items-center gap-1">ضغطة للتكبير</span>
+              </div>
             </div>
 
             {/* Thumbnail History Strip */}

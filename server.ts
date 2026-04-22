@@ -6,9 +6,28 @@ import { chromium } from 'playwright';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const db = new Database('tasks.db');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY, 
+    status TEXT, 
+    total INTEGER,
+    data TEXT
+  );
+  CREATE TABLE IF NOT EXISTS job_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    task_id TEXT, 
+    row_data TEXT, 
+    status TEXT, 
+    notes TEXT,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+  );
+`);
 
 const app = express();
 const PORT = 3000;
@@ -62,9 +81,6 @@ app.get('/api/mobile-fix', (req, res) => {
 // Set up multer for memory storage
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Store active tasks
-const tasks = new Map();
-
 app.post('/api/upload', upload.single('file'), (req, res) => {
   console.log('[DEBUG] Received upload request');
   if (!req.file) {
@@ -73,21 +89,15 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
 
   try {
-    console.log(`[DEBUG] Parsing file: ${req.file.originalname} (${req.file.size} bytes)`);
     const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
     const sheetName = workbook.SheetNames[0];
     const sheet = workbook.Sheets[sheetName];
     const data = xlsx.utils.sheet_to_json(sheet);
 
     const taskId = Date.now().toString();
-    tasks.set(taskId, {
-      status: 'pending',
-      data,
-      progress: 0,
-      total: data.length,
-      results: [],
-      clients: [] // SSE clients
-    });
+    db.prepare('INSERT INTO tasks (id, status, total, data) VALUES (?, ?, ?, ?)').run(
+      taskId, 'pending', data.length, JSON.stringify(data)
+    );
 
     res.json({ taskId, totalRows: data.length });
   } catch (error) {
@@ -96,10 +106,13 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
 });
 
+// SSE clients map to replace task.clients
+const sseClients = new Map();
+
 // SSE Endpoint
 app.get('/api/stream/:taskId', (req, res) => {
   const { taskId } = req.params;
-  const task = tasks.get(taskId);
+  const task = db.prepare('SELECT status, total FROM tasks WHERE id = ?').get(taskId) as any;
 
   if (!task) {
     return res.status(404).json({ error: 'Task not found' });
@@ -109,11 +122,14 @@ app.get('/api/stream/:taskId', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  // Add client to task
-  task.clients.push(res);
+  if (!sseClients.has(taskId)) {
+      sseClients.set(taskId, []);
+  }
+  sseClients.get(taskId).push(res);
 
-  // Send initial state
-  res.write(`data: ${JSON.stringify({ type: 'INIT', progress: task.progress, total: task.total })}\n\n`);
+  // Send initial state (progress is tracked in job_results)
+  const completed = db.prepare('SELECT count(*) as count FROM job_results WHERE task_id = ? AND status = ?').get(taskId, 'success') as any;
+  res.write(`data: ${JSON.stringify({ type: 'INIT', progress: completed.count || 0, total: task.total })}\n\n`);
 
   // Keep-alive ping every 15 seconds
   const pingInterval = setInterval(() => {
@@ -122,13 +138,14 @@ app.get('/api/stream/:taskId', (req, res) => {
 
   req.on('close', () => {
     clearInterval(pingInterval);
-    task.clients = task.clients.filter((client: any) => client !== res);
+    const clients = sseClients.get(taskId) || [];
+    sseClients.set(taskId, clients.filter((client: any) => client !== res));
   });
 });
 
 app.post('/api/start/:taskId', async (req, res) => {
   const { taskId } = req.params;
-  const task = tasks.get(taskId);
+  const task = db.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId) as any;
 
   if (!task) {
     return res.status(404).json({ error: 'Task not found' });
@@ -138,33 +155,21 @@ app.post('/api/start/:taskId', async (req, res) => {
     return res.status(400).json({ error: 'Task already running' });
   }
 
-  task.status = 'running';
+  db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run('running', taskId);
   res.json({ message: 'Task started' });
 
   // Run automation in background
   runAutomation(taskId).catch(err => console.error('Automation error:', err));
 });
 
-function broadcast(task: any, event: any) {
+function broadcast(taskId: string, event: any) {
   const data = `data: ${JSON.stringify(event)}\n\n`;
-  const disconnectedClients: any[] = [];
-  
-  task.clients.forEach((client: any) => {
-    try {
-      if (client.writable) {
-        client.write(data);
-      } else {
-        disconnectedClients.push(client);
-      }
-    } catch (err) {
-      console.error('[SSE] Failed to write to client:', err);
-      disconnectedClients.push(client);
+  const clients = sseClients.get(taskId) || [];
+  clients.forEach((client: any) => {
+    if (client.writable) {
+      client.write(data);
     }
   });
-
-  if (disconnectedClients.length > 0) {
-    task.clients = task.clients.filter((c: any) => !disconnectedClients.includes(c));
-  }
 }
 
 function translatePlaywrightError(errorMsg: string, currentStep: string): string {
@@ -177,16 +182,24 @@ function translatePlaywrightError(errorMsg: string, currentStep: string): string
 }
 
 async function runAutomation(taskId: string) {
-  const task = tasks.get(taskId);
-  if (!task) {
+  const taskRow = db.prepare('SELECT total, data FROM tasks WHERE id = ?').get(taskId) as any;
+  if (!taskRow) {
     console.error(`Task ${taskId} not found`);
     return;
   }
+  const task = { 
+      data: JSON.parse(taskRow.data), 
+      total: taskRow.total 
+  };
 
-  broadcast(task, { type: 'LOG', message: '[SYSTEM] جاري بدء تهيئة المتصفح...' });
+  function localBroadcast(event: any) {
+      broadcast(taskId, event);
+  }
+
+  localBroadcast({ type: 'LOG', message: '[SYSTEM] جاري بدء تهيئة المتصفح...' });
 
   try {
-    broadcast(task, { type: 'LOG', message: '[SYSTEM] جاري استدعاء chromium.launch...' });
+    localBroadcast({ type: 'LOG', message: '[SYSTEM] جاري استدعاء chromium.launch...' });
     
     // Launch browser with a promise timeout
     const launchPromise = chromium.launch({
@@ -201,7 +214,7 @@ async function runAutomation(taskId: string) {
       ]
     }).catch(err => {
       console.error('[CRITICAL] Browser launch failed:', err);
-      broadcast(task, { type: 'LOG', message: `❌ فشل تشغيل المتصفح: ${err.message}` });
+      localBroadcast({ type: 'LOG', message: `❌ فشل تشغيل المتصفح: ${err.message}` });
       throw err;
     });
 
@@ -210,13 +223,13 @@ async function runAutomation(taskId: string) {
     );
 
     const browser = await Promise.race([launchPromise, timeoutPromise]) as any;
-    broadcast(task, { type: 'LOG', message: '[SYSTEM] تم تشغيل المتصفح بنجاح.' });
+    localBroadcast({ type: 'LOG', message: '[SYSTEM] تم تشغيل المتصفح بنجاح.' });
 
     for (let i = 0; i < task.data.length; i++) {
-      const row = task.data[i];
-      const nationalId = row['الرقم القومي'] || row['National ID'] || 'Unknown';
-      
-      broadcast(task, { type: 'LOG', message: `جاري معالجة العميل ${i + 1}: ${nationalId}...` });
+        const row = task.data[i];
+        const nationalId = row['الرقم القومي'] || row['National ID'] || 'Unknown';
+        
+        localBroadcast({ type: 'LOG', message: `جاري معالجة العميل ${i + 1}: ${nationalId}...` });
 
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
@@ -238,14 +251,14 @@ async function runAutomation(taskId: string) {
         const targetUrl = 'https://srv.nbe.com.eg/Online_Booking';
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         
-        broadcast(task, { type: 'LOG', message: `[INFO] تم فتح الرابط المباشر، جاري تحميل العناصر...` });
+        broadcast(taskId, { type: 'LOG', message: `[INFO] تم فتح الرابط المباشر، جاري تحميل العناصر...` });
         await page.waitForTimeout(5000); // Wait for Angular/React to initialize
 
         // Determine if we need to work inside an iframe FIRST
         let targetFrame: any = page;
         const frameCount = await page.locator('iframe').count();
         if (frameCount > 0) {
-            broadcast(task, { type: 'LOG', message: `[INFO] تم العثور على إطار (iframe)، سيتم توجيه الإدخال داخله...` });
+            broadcast(taskId, { type: 'LOG', message: `[INFO] تم العثور على إطار (iframe)، سيتم توجيه الإدخال داخله...` });
             targetFrame = page.frameLocator('iframe').first();
         }
 
@@ -256,14 +269,14 @@ async function runAutomation(taskId: string) {
             
             // Wait up to 8 seconds for the popup to appear
             if (await popupCloseBtn.isVisible({ timeout: 8000 })) {
-                broadcast(task, { type: 'LOG', message: `[INFO] تم العثور على رسالة تحديد الموقع، جاري إغلاقها...` });
+                broadcast(taskId, { type: 'LOG', message: `[INFO] تم العثور على رسالة تحديد الموقع، جاري إغلاقها...` });
                 await popupCloseBtn.evaluate((el: HTMLElement) => el.click()).catch((e: any) => console.log('Failed to click main close button:', e));
                 await page.waitForTimeout(1000);
             } else {
                 // Sometimes it's not a button but an 'a' tag or span
                 const altCloseBtn = targetFrame.locator('a:has-text("اغلاق"), a:has-text("إغلاق"), span:has-text("اغلاق")').first();
                 if (await altCloseBtn.isVisible({ timeout: 2000 })) {
-                    broadcast(task, { type: 'LOG', message: `[INFO] تم العثور على رسالة تحديد الموقع (رابط)، جاري إغلاقها...` });
+                    broadcast(taskId, { type: 'LOG', message: `[INFO] تم العثور على رسالة تحديد الموقع (رابط)، جاري إغلاقها...` });
                     await altCloseBtn.evaluate((el: HTMLElement) => el.click()).catch((e: any) => console.log('Failed to click alt close button:', e));
                     await page.waitForTimeout(1000);
                 }
@@ -277,7 +290,7 @@ async function runAutomation(taskId: string) {
         const startBookingBtn = targetFrame.locator('button:has-text("احجز"), button:has-text("حجز موعد"), a:has-text("احجز"), button:has-text("تقديم"), button:has-text("طلب")').first();
         try {
             if (await startBookingBtn.isVisible({ timeout: 3000 })) {
-                broadcast(task, { type: 'LOG', message: `[INFO] تم العثور على زر بدء الحجز، جاري النقر...` });
+                broadcast(taskId, { type: 'LOG', message: `[INFO] تم العثور على زر بدء الحجز، جاري النقر...` });
                 await startBookingBtn.click();
                 await page.waitForTimeout(4000); // Wait for form to load
             }
@@ -287,7 +300,7 @@ async function runAutomation(taskId: string) {
 
         // Take initial screenshot to see what the bot sees
         let stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'شاشة البداية للموقع', isError: false });
+        broadcast(taskId, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'شاشة البداية للموقع', isError: false });
 
         // Extract data from Excel row
         const phone = row['الهاتف'] || row['رقم الهاتف'] || '';
@@ -300,7 +313,7 @@ async function runAutomation(taskId: string) {
 
         // Step 1: Personal Info
         currentStep = 'إدخال البيانات الشخصية';
-        broadcast(task, { type: 'LOG', message: `الخطوة 1: إدخال البيانات الشخصية...` });
+        broadcast(taskId, { type: 'LOG', message: `الخطوة 1: إدخال البيانات الشخصية...` });
         
         // Wait for any input to appear on the page/frame to ensure form is loaded
         await targetFrame.locator('input').first().waitFor({ state: 'visible', timeout: 15000 }).catch(() => console.log('No inputs visible after 15s'));
@@ -308,12 +321,12 @@ async function runAutomation(taskId: string) {
         // DEBUG: Print available inputs to log
         try {
             const allInputs = await targetFrame.locator('input').evaluateAll((els: HTMLInputElement[]) => els.map(e => ({ id: e.id, placeholder: e.placeholder, name: e.name, type: e.type })));
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Inputs found: ${JSON.stringify(allInputs)}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Inputs found: ${JSON.stringify(allInputs)}` });
             
             const allButtons = await targetFrame.locator('button').evaluateAll((els: HTMLButtonElement[]) => els.map(e => ({ text: e.innerText?.trim(), id: e.id })));
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Buttons found: ${JSON.stringify(allButtons)}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Buttons found: ${JSON.stringify(allButtons)}` });
         } catch (e) {
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Failed to list inputs/buttons: ${e}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Failed to list inputs/buttons: ${e}` });
         }
 
         // Try to find inputs by their exact IDs as seen in the debug logs
@@ -350,7 +363,7 @@ async function runAutomation(taskId: string) {
         }
 
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد إدخال البيانات الشخصية', isError: false });
+        broadcast(taskId, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد إدخال البيانات الشخصية', isError: false });
 
         // Click Next/Execute ("تنفيذ")
         // The debug logs show the submit button is an input with id="Submit_btn"
@@ -399,7 +412,7 @@ async function runAutomation(taskId: string) {
 
         // Step 2: Category & Service
         currentStep = 'اختيار القسم والخدمة';
-        broadcast(task, { type: 'LOG', message: `الخطوة 2: اختيار القسم والخدمة...` });
+        broadcast(taskId, { type: 'LOG', message: `الخطوة 2: اختيار القسم والخدمة...` });
         
         // Wait a moment for the new step to load
         await page.waitForTimeout(2000);
@@ -407,12 +420,12 @@ async function runAutomation(taskId: string) {
         // DEBUG: Print available selects and buttons
         try {
             const allSelects = await targetFrame.locator('select').evaluateAll((els: HTMLSelectElement[]) => els.map(e => ({ id: e.id, name: e.name, options: Array.from(e.options).map(o => o.text.trim()) })));
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Selects found: ${JSON.stringify(allSelects)}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Selects found: ${JSON.stringify(allSelects)}` });
             
             const allButtons = await targetFrame.locator('button, input[type="submit"]').evaluateAll((els: any[]) => els.map(e => ({ text: e.innerText?.trim() || e.value, id: e.id })));
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Buttons found: ${JSON.stringify(allButtons)}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Buttons found: ${JSON.stringify(allButtons)}` });
         } catch (e) {
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Failed to list selects/buttons: ${e}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Failed to list selects/buttons: ${e}` });
         }
 
         // We will try to click dropdowns or select elements
@@ -428,9 +441,9 @@ async function runAutomation(taskId: string) {
                 
                 if (matchedCat) {
                     await catSelect.selectOption({ label: matchedCat });
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار القسم: ${matchedCat}` });
+                    broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار القسم: ${matchedCat}` });
                 } else {
-                    broadcast(task, { type: 'LOG', message: `[WARNING] لم يتم العثور على القسم المطابق لـ: ${category}` });
+                    broadcast(taskId, { type: 'LOG', message: `[WARNING] لم يتم العثور على القسم المطابق لـ: ${category}` });
                 }
                 
                 await page.waitForTimeout(2000); // Wait for services to load based on category
@@ -443,12 +456,12 @@ async function runAutomation(taskId: string) {
                 
                 if (matchedSrv) {
                     await srvSelect.selectOption({ label: matchedSrv });
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار الخدمة: ${matchedSrv}` });
+                    broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار الخدمة: ${matchedSrv}` });
                 } else {
-                    broadcast(task, { type: 'LOG', message: `[WARNING] لم يتم العثور على الخدمة المطابقة لـ: ${service}` });
+                    broadcast(taskId, { type: 'LOG', message: `[WARNING] لم يتم العثور على الخدمة المطابقة لـ: ${service}` });
                 }
             } catch (err) {
-                broadcast(task, { type: 'LOG', message: `[DEBUG] Error interacting with dropdowns: ${err}` });
+                broadcast(taskId, { type: 'LOG', message: `[DEBUG] Error interacting with dropdowns: ${err}` });
             }
         } else {
             // Fallback for non-select dropdowns (if they change it later)
@@ -467,7 +480,7 @@ async function runAutomation(taskId: string) {
         }
 
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد اختيار الخدمة', isError: false });
+        broadcast(taskId, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد اختيار الخدمة', isError: false });
 
         const nextBtn2 = targetFrame.locator('#Submit_btn, input[type="submit"], button:has-text("تنفيذ"), button:has-text("التالي"), button:has-text("Next"), button:has-text("استمرار")').first();
         if (await nextBtn2.isVisible({ timeout: 5000 })) {
@@ -488,7 +501,7 @@ async function runAutomation(taskId: string) {
 
         // Step 3: Branch Selection
         currentStep = 'اختيار الفرع';
-        broadcast(task, { type: 'LOG', message: `الخطوة 3: اختيار الفرع (القاهرة -> مدينة نصر -> عباس العقاد)...` });
+        broadcast(taskId, { type: 'LOG', message: `الخطوة 3: اختيار الفرع (القاهرة -> مدينة نصر -> عباس العقاد)...` });
         
         await page.waitForTimeout(3000); 
         
@@ -511,11 +524,11 @@ async function runAutomation(taskId: string) {
             if (matchedGov) {
                 await govSelect.selectOption(matchedGov.value);
                 await govSelect.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
-                broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار المحافظة: ${matchedGov.text}` });
+                broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار المحافظة: ${matchedGov.text}` });
             }
 
             // Waiting for Region (مدينة نصر) - Essential for Select2/Dynamic load
-            broadcast(task, { type: 'LOG', message: `[PROCESS] جاري انتظار تفعيل قائمة المنطقة...` });
+            broadcast(taskId, { type: 'LOG', message: `[PROCESS] جاري انتظار تفعيل قائمة المنطقة...` });
             
             let isRegReady = false;
             for(let i=0; i<30; i++) { // Up to 30s as per video behavior
@@ -535,7 +548,7 @@ async function runAutomation(taskId: string) {
                 if (matchedReg) {
                     await regSelect.selectOption(matchedReg.value);
                     await regSelect.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار المنطقة: ${matchedReg.text}` });
+                    broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار المنطقة: ${matchedReg.text}` });
                     await page.waitForTimeout(3000); // Wait for branches to appear
                 }
             }
@@ -547,12 +560,12 @@ async function runAutomation(taskId: string) {
             if (await searchInput.isVisible({ timeout: 5000 })) {
                 await searchInput.fill(branchSearchTerm);
                 await searchInput.press('Enter');
-                broadcast(task, { type: 'LOG', message: `[PROCESS] تم البحث عن الفرع...` });
+                broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم البحث عن الفرع...` });
                 await page.waitForTimeout(3000); 
             }
 
             // 3. Selection of Radio Button
-            broadcast(task, { type: 'LOG', message: `[PROCESS] جاري انتظار ورصد الفروع في الصفحة...` });
+            broadcast(taskId, { type: 'LOG', message: `[PROCESS] جاري انتظار ورصد الفروع في الصفحة...` });
             
             const radiosLocator = targetFrame.locator('input[type="radio"]');
             
@@ -562,12 +575,12 @@ async function runAutomation(taskId: string) {
                 await radiosLocator.first().waitFor({ state: 'attached', timeout: 8000 });
                 radiosAvailable = true;
             } catch (e) {
-                broadcast(task, { type: 'LOG', message: `⚠️ وقت انتظار الفروع انتهى.` });
+                broadcast(taskId, { type: 'LOG', message: `⚠️ وقت انتظار الفروع انتهى.` });
             }
 
             if (radiosAvailable) {
                 const count = await radiosLocator.count();
-                broadcast(task, { type: 'LOG', message: `[PROCESS] تم رصد ${count} خيارات بالبرمجة.` });
+                broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم رصد ${count} خيارات بالبرمجة.` });
                 
                 const normalize = (s: string) => s.replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/\s+/g, '').trim();
                 const targetNorm = normalize(branchSearchTerm);
@@ -588,14 +601,14 @@ async function runAutomation(taskId: string) {
                         }).catch(() => {});
                         
                         branchClicked = true;
-                        broadcast(task, { type: 'LOG', message: `✅ تم العثور على الفرع المطلوب واختياره.` });
+                        broadcast(taskId, { type: 'LOG', message: `✅ تم العثور على الفرع المطلوب واختياره.` });
                         break;
                     }
                 }
 
                 // Tier 2: Fallback to first available using locators
                 if (!branchClicked) {
-                    broadcast(task, { type: 'LOG', message: `⚠️ لم يُطابق الاسم أي فرع، جاري إجبار اختيار أول فرع...` });
+                    broadcast(taskId, { type: 'LOG', message: `⚠️ لم يُطابق الاسم أي فرع، جاري إجبار اختيار أول فرع...` });
                     const firstRadio = radiosLocator.first();
                     await firstRadio.click({ force: true }).catch(() => {});
                     await firstRadio.evaluate((el: HTMLInputElement) => {
@@ -605,11 +618,11 @@ async function runAutomation(taskId: string) {
                     }).catch(() => {});
                     
                     branchClicked = true;
-                    broadcast(task, { type: 'LOG', message: `✅ تم إجبار اختيار الفرع الأول.` });
+                    broadcast(taskId, { type: 'LOG', message: `✅ تم إجبار اختيار الفرع الأول.` });
                 }
             } else {
                 // Tier 3: Extreme fallback JS evaluation without offsetParent restriction
-                broadcast(task, { type: 'LOG', message: `⚠️ محاولة أخيرة عبر حقن سكربت (JS) للبحث عن الدوائر...` });
+                broadcast(taskId, { type: 'LOG', message: `⚠️ محاولة أخيرة عبر حقن سكربت (JS) للبحث عن الدوائر...` });
                 const frames = page.frames();
                 for (const f of frames) {
                     try {
@@ -626,7 +639,7 @@ async function runAutomation(taskId: string) {
 
                         if (anyRadioFound) {
                             branchClicked = true;
-                            broadcast(task, { type: 'LOG', message: `✅ نجحت المحاولة الأخيرة بالتحديد عبر السكربت.` });
+                            broadcast(taskId, { type: 'LOG', message: `✅ نجحت المحاولة الأخيرة بالتحديد عبر السكربت.` });
                             break;
                         }
                     } catch (e) {}
@@ -634,20 +647,20 @@ async function runAutomation(taskId: string) {
             }
 
             if (!branchClicked) {
-                broadcast(task, { type: 'LOG', message: `⚠️ لم يتم العثور على أي فروع متاحة للاختيار. سيتم المحاولة بالضغط على "تنفيذ" للتحقق.` });
+                broadcast(taskId, { type: 'LOG', message: `⚠️ لم يتم العثور على أي فروع متاحة للاختيار. سيتم المحاولة بالضغط على "تنفيذ" للتحقق.` });
             }
 
             await page.waitForTimeout(1500);
         } catch (err) {
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Error in Step 3 selection: ${err}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Error in Step 3 selection: ${err}` });
         }
         
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'الحالة قبل الضغط على تنفيذ', isError: false });
+        broadcast(taskId, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'الحالة قبل الضغط على تنفيذ', isError: false });
 
         const nextBtn3 = targetFrame.locator('button:has-text("تنفيذ"), #Submit_btn, input[type="submit"]').first();
         if (await nextBtn3.isVisible({ timeout: 5000 })) {
-            broadcast(task, { type: 'LOG', message: `[PROCESS] الضغط على زر "تنفيذ"...` });
+            broadcast(taskId, { type: 'LOG', message: `[PROCESS] الضغط على زر "تنفيذ"...` });
             await nextBtn3.click({ force: true });
             
             // Step 3 Validation: "Required" appears AFTER clicking if selection failed, OR we don't transition to Time selection
@@ -656,7 +669,7 @@ async function runAutomation(taskId: string) {
             
             if (isRequiredVisible) {
                 const errorShot = await page.screenshot({ type: 'jpeg', quality: 80 });
-                broadcast(task, { type: 'SCREENSHOT', image: errorShot.toString('base64'), caption: 'خطأ: لم يتم اختيار الفرع', isError: true });
+                broadcast(taskId, { type: 'SCREENSHOT', image: errorShot.toString('base64'), caption: 'خطأ: لم يتم اختيار الفرع', isError: true });
                 throw new Error(`فشل تجاوز الفرع: رسالة "مطلوب" ظهرت. يبدو أن الفرع مغلق أو لا يوجد مواعيد.`);
             }
 
@@ -666,14 +679,14 @@ async function runAutomation(taskId: string) {
                 throw new Error(`فشل الانتقال إلى المواعيد بعد تأكيد الفرع. قد تكون الفروع ممتلئة تماماً لهذا اليوم.`);
             }
 
-            broadcast(task, { type: 'LOG', message: `[SUCCESS] تم تجاوز مرحلة اختيار الفرع بنجاح.` });
+            broadcast(taskId, { type: 'LOG', message: `[SUCCESS] تم تجاوز مرحلة اختيار الفرع بنجاح.` });
         } else {
             throw new Error(`توقف العملية: لم يتم العثور على زر "تنفيذ" بعد تحديد الفرع.`);
         }
 
         // Step 4: Date & Time
         currentStep = 'اختيار الموعد والتوقيت';
-        broadcast(task, { type: 'LOG', message: `الخطوة 4: اختيار الموعد والتوقيت...` });
+        broadcast(taskId, { type: 'LOG', message: `الخطوة 4: اختيار الموعد والتوقيت...` });
         
         try {
             // First: attempt to locate a dropdown (Legacy/Current structure)
@@ -711,7 +724,7 @@ async function runAutomation(taskId: string) {
                      const opts = await daySelect.locator('option').evaluateAll((os: HTMLOptionElement[]) => os.filter(o => o.value && !['', '0'].includes(o.value) && !o.textContent?.includes('اختر')).map(o => o.value));
                      if (opts.length > 0) {
                          await daySelect.selectOption(opts[0]);
-                         broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار اليوم بنجاح.` });
+                         broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار اليوم بنجاح.` });
                          await page.waitForTimeout(3000); // Allow time to fetch times
                      }
                  }
@@ -720,13 +733,13 @@ async function runAutomation(taskId: string) {
                      const opts = await timeSelect.locator('option').evaluateAll((os: HTMLOptionElement[]) => os.filter(o => o.value && !['', '0'].includes(o.value) && !o.textContent?.includes('اختر')).map(o => o.value));
                      if (opts.length > 0) {
                          await timeSelect.selectOption(opts[0]);
-                         broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت بنجاح.` });
+                         broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت بنجاح.` });
                          await page.waitForTimeout(2000);
                      }
                  }
             } else if (radioCount > 0) {
                 // Video pattern: List of dates as radio buttons, click first available
-                broadcast(task, { type: 'LOG', message: `[PROCESS] تم العثور على تواريخ بنظام الأزرار (Radios)، اختيار الأول...` });
+                broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم العثور على تواريخ بنظام الأزرار (Radios)، اختيار الأول...` });
                 await dateRadios.first().click({ force: true });
                 await page.waitForTimeout(2000); // Sometimes picking a date reveals time buttons
                 
@@ -734,18 +747,18 @@ async function runAutomation(taskId: string) {
                 const timeRadios = targetFrame.locator('input[type="radio"], .radio-button'); // Refetch
                 if (await timeRadios.count() > 1 && await timeRadios.nth(1).isVisible()) {
                       await timeRadios.nth(1).click({ force: true }).catch(() => {});
-                      broadcast(task, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت من أزرار الأوقات.` });
+                      broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت من أزرار الأوقات.` });
                       await page.waitForTimeout(2000);
                 }
             } else {
-                 broadcast(task, { type: 'LOG', message: `⚠️ لم يتم رصد أي قوائم أو أزرار تواريخ.` });
+                 broadcast(taskId, { type: 'LOG', message: `⚠️ لم يتم رصد أي قوائم أو أزرار تواريخ.` });
             }
         } catch (e) {
-            broadcast(task, { type: 'LOG', message: `[DEBUG] Error Step 4: ${e}` });
+            broadcast(taskId, { type: 'LOG', message: `[DEBUG] Error Step 4: ${e}` });
         }
 
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
-        broadcast(task, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد اختيار الموعد', isError: false });
+        broadcast(taskId, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد اختيار الموعد', isError: false });
 
         const confirmBtn = targetFrame.locator('button:has-text("تنفيذ"), #Submit_btn, input[type="submit"]').first();
         if (await confirmBtn.isVisible({ timeout: 5000 })) {
@@ -775,7 +788,7 @@ async function runAutomation(taskId: string) {
 
         // Step 5: Confirmation Ticket
         currentStep = 'تأكيد الحجز واستخراج التذكرة';
-        broadcast(task, { type: 'LOG', message: `الخطوة 5: جاري تأكيد الحجز واستخراج التذكرة...` });
+        broadcast(taskId, { type: 'LOG', message: `الخطوة 5: جاري تأكيد الحجز واستخراج التذكرة...` });
         
         // Wait explicitly for the final elements to appear
         await page.waitForTimeout(4000); 
@@ -785,7 +798,7 @@ async function runAutomation(taskId: string) {
 
         // Take a full-page screenshot of the final state right away for debug logs (NOT flagged as ticket)
         const successScreenshot = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: true });
-        broadcast(task, { 
+        broadcast(taskId, { 
           type: 'SCREENSHOT', 
           image: successScreenshot.toString('base64'), 
           caption: `النتيجة النهائية (لقطة الشاشة كاملة) - ${nationalId}`,
@@ -798,7 +811,7 @@ async function runAutomation(taskId: string) {
         
         try {
             // 1. Take a clean, targeted screenshot of the ticket modal itself
-            broadcast(task, { type: 'LOG', message: `[PROCESS] محاولة العثور على التذكرة لقصها (بالبحث التسلقي)...` });
+            broadcast(taskId, { type: 'LOG', message: `[PROCESS] محاولة العثور على التذكرة لقصها (بالبحث التسلقي)...` });
                 
                 const findTicketLogic = () => {
                     // Look for common text nodes strictly inside the ticket
@@ -870,17 +883,17 @@ async function runAutomation(taskId: string) {
                                 throw new Error("Bounding box null or zero");
                             }
                         } catch (e: any) {
-                             broadcast(task, { type: 'LOG', message: `[DEBUG] فشل القص الدقيق (${e.message})، سيتم محاولة حفظ المشهد المعروض.` });
+                             broadcast(taskId, { type: 'LOG', message: `[DEBUG] فشل القص الدقيق (${e.message})، سيتم محاولة حفظ المشهد المعروض.` });
                              // If completely detached, try blindly capturing without checks, failing fast if needed
                              ticketShotBase64 = (await page.screenshot({ type: 'jpeg', quality: 90 })).toString('base64');
                         }
                     }
                 } catch (shotErr: any) {
-                    broadcast(task, { type: 'LOG', message: `[DEBUG] حدث خطأ أثناء قص الصورة: ${shotErr.message}` });
+                    broadcast(taskId, { type: 'LOG', message: `[DEBUG] حدث خطأ أثناء قص الصورة: ${shotErr.message}` });
                 }
 
                 if (ticketShotBase64) {
-                    broadcast(task, { 
+                    broadcast(taskId, { 
                         type: 'SCREENSHOT', 
                         image: ticketShotBase64, 
                         caption: `تذكرة العميل: ${nationalId}`,
@@ -888,19 +901,19 @@ async function runAutomation(taskId: string) {
                         isTicket: true // <--- sends only the clean cropped ticket to the gallery
                     });
                 } else {
-                    broadcast(task, { type: 'LOG', message: `⚠️ لم يتم العثور على الإطار الأبيض للتذكرة لقصها!` });
+                    broadcast(taskId, { type: 'LOG', message: `⚠️ لم يتم العثور على الإطار الأبيض للتذكرة لقصها!` });
                 }
 
                 // 2. Click Download button if present
                 const downloadBtn = targetFrame.locator('button:has-text("Download"), a:has-text("Download"), .download, button:has-text("تحميل"), a:has-text("تحميل")').first();
                 if (await downloadBtn.isVisible({ timeout: 3000 })) {
-                    broadcast(task, { type: 'LOG', message: `[PROCESS] تم العثور على زر التنزيل، جاري الضغط عليه...` });
+                    broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم العثور على زر التنزيل، جاري الضغط عليه...` });
                     await downloadBtn.click({ force: true }).catch(() => {});
-                    broadcast(task, { type: 'LOG', message: `✅ تم الضغط على زر التنزيل بنجاح.` });
+                    broadcast(taskId, { type: 'LOG', message: `✅ تم الضغط على زر التنزيل بنجاح.` });
                     await page.waitForTimeout(3000); // Give it time to trigger
                 }
             } catch (ticketErr) {
-                broadcast(task, { type: 'LOG', message: `[DEBUG] اكتمل الحجز ولكن واجهنا التأخير في تصوير التذكرة: ${ticketErr}` });
+                broadcast(taskId, { type: 'LOG', message: `[DEBUG] اكتمل الحجز ولكن واجهنا التأخير في تصوير التذكرة: ${ticketErr}` });
             }
       } catch (error: any) {
         const rawError = error.message || 'Error occurred';
@@ -909,15 +922,15 @@ async function runAutomation(taskId: string) {
         status = 'فشل';
         note = friendlyError;
         
-        broadcast(task, { type: 'LOG', message: `[ERROR] فشل الحجز: ${friendlyError}` });
-        broadcast(task, { type: 'LOG', message: `[SYSTEM] تفاصيل الخطأ التقني: ${rawError.split('\n')[0]}` });
+        broadcast(taskId, { type: 'LOG', message: `[ERROR] فشل الحجز: ${friendlyError}` });
+        broadcast(taskId, { type: 'LOG', message: `[SYSTEM] تفاصيل الخطأ التقني: ${rawError.split('\n')[0]}` });
         
         try {
           // Take a detailed full-page screenshot on error
           const errorScreenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: true });
           const currentUrl = page.url();
           
-          broadcast(task, { 
+          broadcast(taskId, { 
             type: 'SCREENSHOT', 
             image: errorScreenshot.toString('base64'), 
             caption: `❌ خطأ في خطوة (${currentStep}) - الرابط: ${currentUrl.substring(0, 50)}...`,
@@ -930,26 +943,34 @@ async function runAutomation(taskId: string) {
         await context.close();
       }
 
-      task.progress = i + 1;
       const resultRow = { ...row, 'حالة الحجز': status, 'ملاحظات': note };
-      task.results.push(resultRow);
       
-      broadcast(task, { 
+      // Save result to sqlite
+      db.prepare('INSERT INTO job_results (task_id, row_data, status, notes) VALUES (?, ?, ?, ?)').run(
+        taskId, JSON.stringify(resultRow), status === 'ناجح' || status === 'نجاح' || status === 'تم' ? 'success' : 'failed', note
+      );
+      
+      broadcast(taskId, { 
         type: 'PROGRESS', 
-        progress: task.progress, 
+        progress: i + 1, 
         total: task.total,
         result: resultRow
       });
     }
 
     await browser.close();
-    task.status = 'completed';
-    broadcast(task, { type: 'COMPLETE', results: task.results });
+    db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run('success', taskId);
+    
+    // Fetch all results to send in complete event
+    const resultsTable = db.prepare('SELECT row_data FROM job_results WHERE task_id = ? ORDER BY id ASC').all(taskId) as any[];
+    const allResults = resultsTable.map(r => JSON.parse(r.row_data));
+    
+    broadcast(taskId, { type: 'COMPLETE', results: allResults });
 
   } catch (error: any) {
-    console.error('Browser launch error:', error);
-    broadcast(task, { type: 'LOG', message: `Browser Error: ${error.message}` });
-    task.status = 'failed';
+    console.error('Automation error details:', error);
+    broadcast(taskId, { type: 'LOG', message: `❌ حدث خطأ في النظام: ${error.message}` });
+    db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run('failed', taskId);
   }
 }
 
