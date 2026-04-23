@@ -2,8 +2,13 @@ import 'dotenv/config';
 import express from 'express';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
-import { chromium } from 'playwright';
+import { chromium } from 'playwright-extra';
+// @ts-ignore
+import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { createServer as createViteServer } from 'vite';
+
+chromium.use(stealthPlugin());
+
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
@@ -28,6 +33,51 @@ db.exec(`
     FOREIGN KEY(task_id) REFERENCES tasks(id)
   );
 `);
+
+/**
+ * Helper to send photo to Telegram
+ */
+async function sendTelegramTicket(base64Image: string, captionText: string) {
+  let token = process.env.TELEGRAM_BOT_TOKEN;
+  let chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log('[Telegram] Missing Token or Chat ID');
+    return;
+  }
+
+  // Clean the secrets from any invisible spaces or accidental quotes
+  token = token.trim().replace(/^['"]|['"]$/g, '');
+  chatId = chatId.trim().replace(/^['"]|['"]$/g, '');
+
+  try {
+    const buffer = Buffer.from(base64Image, 'base64');
+    const blob = new Blob([buffer], { type: 'image/jpeg' });
+    const formData = new FormData();
+    formData.append('chat_id', chatId);
+    formData.append('photo', blob, 'ticket.jpg');
+    formData.append('caption', captionText);
+
+    const TELEGRAM_API = `https://api.telegram.org/bot${token}/sendPhoto`;
+    
+    const response = await fetch(TELEGRAM_API, {
+      method: 'POST',
+      body: formData as any
+    });
+
+    const data = await response.json();
+    if (!data.ok) {
+        if (data.error_code === 404) {
+            console.error('[Telegram] Failed: 404 Not Found. This usually means the TELEGRAM_BOT_TOKEN is invalid or incorrect.');
+        } else {
+            console.error('[Telegram] Failed to send photo:', data);
+        }
+    } else {
+        console.log('[Telegram] Ticket sent successfully!');
+    }
+  } catch (error) {
+    console.error('[Telegram] Error sending ticket:', error);
+  }
+}
 
 const app = express();
 const PORT = 3000;
@@ -162,6 +212,27 @@ app.post('/api/start/:taskId', async (req, res) => {
   runAutomation(taskId).catch(err => console.error('Automation error:', err));
 });
 
+// Download Results as Excel Endpoint
+app.get('/api/export/:taskId', (req, res) => {
+  const { taskId } = req.params;
+  const resultsTable = db.prepare('SELECT row_data FROM job_results WHERE task_id = ? ORDER BY id ASC').all(taskId) as any[];
+  
+  if (resultsTable.length === 0) {
+    return res.status(404).json({ error: 'No results found for this task' });
+  }
+
+  const data = resultsTable.map(r => JSON.parse(r.row_data));
+  const worksheet = xlsx.utils.json_to_sheet(data);
+  const workbook = xlsx.utils.book_new();
+  xlsx.utils.book_append_sheet(workbook, worksheet, 'Results');
+  
+  const buffer = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+  
+  res.setHeader('Content-Disposition', `attachment; filename="booking_results_${taskId}.xlsx"`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buffer);
+});
+
 function broadcast(taskId: string, event: any) {
   const data = `data: ${JSON.stringify(event)}\n\n`;
   const clients = sseClients.get(taskId) || [];
@@ -223,29 +294,38 @@ async function runAutomation(taskId: string) {
     );
 
     const browser = await Promise.race([launchPromise, timeoutPromise]) as any;
-    localBroadcast({ type: 'LOG', message: '[SYSTEM] تم تشغيل المتصفح بنجاح.' });
+    localBroadcast({ type: 'LOG', message: '[SYSTEM] تم تشغيل المتصفح بنجاح، جاري تفعيل العمل المتوازي (Browser Pool)...' });
 
-    for (let i = 0; i < task.data.length; i++) {
+    const CONCURRENCY_LIMIT = 3;
+    let currentIndex = 0;
+    let completedCount = 0;
+
+    async function processNext() {
+      while (currentIndex < task.data.length) {
+        const i = currentIndex++;
         const row = task.data[i];
         const nationalId = row['الرقم القومي'] || row['National ID'] || 'Unknown';
         
         localBroadcast({ type: 'LOG', message: `جاري معالجة العميل ${i + 1}: ${nationalId}...` });
 
-      const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        viewport: { width: 390, height: 844 },
-        deviceScaleFactor: 3,
-        hasTouch: true,
-        isMobile: true,
-        locale: 'ar-EG'
-      });
-
-      const page = await context.newPage();
       let status = 'فشل';
       let note = 'Unknown error';
-      let currentStep = 'تهيئة المتصفح';
+      const MAX_RETRIES = 3;
 
-      try {
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        const context = await browser.newContext({
+          userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+          viewport: { width: 390, height: 844 },
+          deviceScaleFactor: 3,
+          hasTouch: true,
+          isMobile: true,
+          locale: 'ar-EG'
+        });
+
+        const page = await context.newPage();
+        let currentStep = 'تهيئة المتصفح';
+
+        try {
         // 1. Open Site
         currentStep = 'فتح صفحة الحجز';
         const targetUrl = 'https://srv.nbe.com.eg/Online_Booking';
@@ -900,6 +980,9 @@ async function runAutomation(taskId: string) {
                         isError: false,
                         isTicket: true // <--- sends only the clean cropped ticket to the gallery
                     });
+
+                    // Send to Telegram if configured
+                    sendTelegramTicket(ticketShotBase64, `✅ تم الحجز بنجاح!\nالعميل: ${nationalId}\nالفرع: ${branch || region}\nالتوقيت: ${row['الوقت'] || ''}`);
                 } else {
                     broadcast(taskId, { type: 'LOG', message: `⚠️ لم يتم العثور على الإطار الأبيض للتذكرة لقصها!` });
                 }
@@ -915,33 +998,37 @@ async function runAutomation(taskId: string) {
             } catch (ticketErr) {
                 broadcast(taskId, { type: 'LOG', message: `[DEBUG] اكتمل الحجز ولكن واجهنا التأخير في تصوير التذكرة: ${ticketErr}` });
             }
-      } catch (error: any) {
-        const rawError = error.message || 'Error occurred';
-        const friendlyError = translatePlaywrightError(rawError, currentStep);
-        
-        status = 'فشل';
-        note = friendlyError;
-        
-        broadcast(taskId, { type: 'LOG', message: `[ERROR] فشل الحجز: ${friendlyError}` });
-        broadcast(taskId, { type: 'LOG', message: `[SYSTEM] تفاصيل الخطأ التقني: ${rawError.split('\n')[0]}` });
-        
-        try {
-          // Take a detailed full-page screenshot on error
-          const errorScreenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: true });
-          const currentUrl = page.url();
+          // Success break point
+          break;
+        } catch (error: any) {
+          const rawError = error.message || 'Error occurred';
+          const friendlyError = translatePlaywrightError(rawError, currentStep);
           
-          broadcast(taskId, { 
-            type: 'SCREENSHOT', 
-            image: errorScreenshot.toString('base64'), 
-            caption: `❌ خطأ في خطوة (${currentStep}) - الرابط: ${currentUrl.substring(0, 50)}...`,
-            isError: true
-          });
-        } catch (e) {
-          console.error('Failed to take error screenshot', e);
+          status = 'فشل';
+          note = friendlyError;
+          
+          broadcast(taskId, { type: 'LOG', message: `[ERROR] فشل محاولة ${attempt}: ${friendlyError}` });
+          broadcast(taskId, { type: 'LOG', message: `[SYSTEM] تفاصيل الخطأ: ${rawError.split('\n')[0]}` });
+          
+          try {
+            const errorScreenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: true });
+            broadcast(taskId, { 
+              type: 'SCREENSHOT', 
+              image: errorScreenshot.toString('base64'), 
+              caption: `❌ خطأ (${currentStep}) [محاولة ${attempt}]`,
+              isError: true
+            });
+          } catch (e) {}
+
+          if (attempt < MAX_RETRIES) {
+             broadcast(taskId, { type: 'LOG', message: `⏳ إعادة محاولة الحجز للعميل (${attempt + 1}/${MAX_RETRIES})...` });
+          } else {
+             broadcast(taskId, { type: 'LOG', message: `❌ تم استنفاد كل المحاولات للعميل.` });
+          }
+        } finally {
+          await context.close();
         }
-      } finally {
-        await context.close();
-      }
+      } // End of retry loop
 
       const resultRow = { ...row, 'حالة الحجز': status, 'ملاحظات': note };
       
@@ -950,13 +1037,21 @@ async function runAutomation(taskId: string) {
         taskId, JSON.stringify(resultRow), status === 'ناجح' || status === 'نجاح' || status === 'تم' ? 'success' : 'failed', note
       );
       
+      completedCount++;
       broadcast(taskId, { 
         type: 'PROGRESS', 
-        progress: i + 1, 
+        progress: completedCount, 
         total: task.total,
         result: resultRow
       });
+      }
     }
+
+    const workers = [];
+    for (let w = 0; w < CONCURRENCY_LIMIT; w++) {
+      workers.push(processNext());
+    }
+    await Promise.all(workers);
 
     await browser.close();
     db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run('success', taskId);

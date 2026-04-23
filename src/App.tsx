@@ -640,12 +640,22 @@ export default function App() {
                   <><Play className="w-4 h-4" /> بدء الأتمتة</>
                 )}
               </button>
-              <button 
-                onClick={generateMockData}
-                className="flex-1 py-2.5 px-4 bg-[#f4f7f6] border border-slate-200 text-slate-700 rounded-md hover:bg-slate-100 transition-colors font-semibold text-sm flex items-center justify-center gap-2"
-              >
-                <FileSpreadsheet className="w-4 h-4" /> بيانات تجريبية
-              </button>
+              {status === 'completed' && taskId ? (
+                <a
+                  href={`/api/export/${taskId}`}
+                  download
+                  className="flex-1 py-2.5 px-4 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 font-semibold text-sm flex items-center justify-center gap-2 transition-colors"
+                >
+                  <Download className="w-4 h-4" /> تحميل النتيجة
+                </a>
+              ) : (
+                <button 
+                  onClick={generateMockData}
+                  className="flex-1 py-2.5 px-4 bg-[#f4f7f6] border border-slate-200 text-slate-700 rounded-md hover:bg-slate-100 transition-colors font-semibold text-sm flex items-center justify-center gap-2"
+                >
+                  <FileSpreadsheet className="w-4 h-4" /> بيانات تجريبية
+                </button>
+              )}
             </div>
             {file && <p className="text-xs text-[#007a33] font-medium mt-3 w-full truncate">الملف: {file.name}</p>}
           </div>

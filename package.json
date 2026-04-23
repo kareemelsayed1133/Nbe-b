@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "postinstall": "npx playwright install chromium chromium-headless-shell"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -24,6 +25,8 @@
     "motion": "^12.23.24",
     "multer": "^2.1.1",
     "playwright": "^1.59.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.5.0",
