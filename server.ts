@@ -21,8 +21,27 @@ import Database from 'better-sqlite3';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/tasks.db' : path.join(process.cwd(), 'tasks.db');
-const db = new Database(dbPath);
+let dbPath = path.join(process.cwd(), 'tasks.db');
+if (process.env.NODE_ENV === 'production') {
+  dbPath = '/tmp/tasks.db';
+}
+try {
+  fs.accessSync(process.cwd(), fs.constants.W_OK);
+} catch (e) {
+  dbPath = '/tmp/tasks.db';
+}
+let db;
+try {
+  db = new Database(dbPath);
+  // Ensure it works
+  db.exec('PRAGMA user_version;');
+} catch (err) {
+  console.log("Database corrupt or unreadable, re-creating...", err.message);
+  try {
+    fs.unlinkSync(dbPath);
+  } catch(e) {}
+  db = new Database(dbPath);
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY, 
@@ -180,6 +199,10 @@ async function sendTelegramTicket(base64Image: string, captionText: string) {
 
 const app = express();
 const PORT = 3000;
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
