@@ -32,47 +32,140 @@ db.exec(`
     notes TEXT,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
   );
+  CREATE TABLE IF NOT EXISTS telegram_subscribers (
+    chat_id TEXT PRIMARY KEY,
+    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
+
+/**
+ * Telegram Polling Service to accept subscriptions
+ */
+let lastUpdateId = 0;
+function startTelegramPolling() {
+  let token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+  token = token.trim().replace(/^['"]|['"]$/g, '');
+
+  console.log('[Telegram] Polling started for subscriptions...');
+  
+  setInterval(async () => {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`);
+      if (!res.ok) return;
+      const data = await res.json();
+      
+      if (data.ok && data.result.length > 0) {
+        for (const update of data.result) {
+          lastUpdateId = Math.max(lastUpdateId, update.update_id);
+          
+          if (update.message && update.message.text) {
+            const text = update.message.text.trim();
+            const chatId = update.message.chat.id.toString();
+            
+            if (text === '/start' || text === '/subscribe') {
+              // Add to subscribers
+              try {
+                db.prepare('INSERT OR IGNORE INTO telegram_subscribers (chat_id) VALUES (?)').run(chatId);
+                
+                await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: chatId,
+                    text: '✅ أهلاً بك! تم تسجيل اشتراكك بنجاح. \nستتلقى إشعارات وصور التذاكر فور كل عملية حجز ناجحة في النظام.'
+                  })
+                });
+                console.log(`[Telegram] New subscriber added: ${chatId}`);
+              } catch (err) {
+                console.error('[Telegram] Error adding subscriber', err);
+              }
+            } else if (text === '/unsubscribe') {
+              try {
+                db.prepare('DELETE FROM telegram_subscribers WHERE chat_id = ?').run(chatId);
+                await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: chatId, text: '❌ تم إلغاء اشتراكك. لن تصلك الإشعارات بعد الآن.' })
+                });
+                console.log(`[Telegram] Subscriber removed: ${chatId}`);
+              } catch (err) {}
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore network timeouts silently
+    }
+  }, 3000);
+}
+
+// Start polling
+startTelegramPolling();
 
 /**
  * Helper to send photo to Telegram
  */
 async function sendTelegramTicket(base64Image: string, captionText: string) {
   let token = process.env.TELEGRAM_BOT_TOKEN;
-  let chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) {
-    console.log('[Telegram] Missing Token or Chat ID');
+  if (!token) {
+    console.log('[Telegram] Missing Token');
     return;
   }
 
   // Clean the secrets from any invisible spaces or accidental quotes
   token = token.trim().replace(/^['"]|['"]$/g, '');
-  chatId = chatId.trim().replace(/^['"]|['"]$/g, '');
 
   try {
-    const buffer = Buffer.from(base64Image, 'base64');
-    const blob = new Blob([buffer], { type: 'image/jpeg' });
-    const formData = new FormData();
-    formData.append('chat_id', chatId);
-    formData.append('photo', blob, 'ticket.jpg');
-    formData.append('caption', captionText);
-
-    const TELEGRAM_API = `https://api.telegram.org/bot${token}/sendPhoto`;
+    // Collect all chat IDs to notify
+    const chatIds = new Set<string>();
     
-    const response = await fetch(TELEGRAM_API, {
-      method: 'POST',
-      body: formData as any
-    });
+    // 1. Add admin from env if present
+    const envChatId = process.env.TELEGRAM_CHAT_ID;
+    if (envChatId) {
+      chatIds.add(envChatId.trim().replace(/^['"]|['"]$/g, ''));
+    }
 
-    const data = await response.json();
-    if (!data.ok) {
-        if (data.error_code === 404) {
-            console.error('[Telegram] Failed: 404 Not Found. This usually means the TELEGRAM_BOT_TOKEN is invalid or incorrect.');
-        } else {
-            console.error('[Telegram] Failed to send photo:', data);
-        }
-    } else {
-        console.log('[Telegram] Ticket sent successfully!');
+    // 2. Fetch subscribed users from SQLite
+    const subscribers = db.prepare('SELECT chat_id FROM telegram_subscribers').all() as { chat_id: string }[];
+    subscribers.forEach(sub => chatIds.add(sub.chat_id));
+
+    if (chatIds.size === 0) {
+      console.log('[Telegram] No subscribers or admin chat ID available to send to.');
+      return;
+    }
+
+    const buffer = Buffer.from(base64Image, 'base64');
+    const TELEGRAM_API = `https://api.telegram.org/bot${token}/sendPhoto`;
+
+    // Dispatch to all uniquely identified users sequentially
+    for (const targetChatId of chatIds) {
+      const blob = new Blob([buffer], { type: 'image/jpeg' });
+      const formData = new FormData();
+      formData.append('chat_id', targetChatId);
+      formData.append('photo', blob, 'ticket.jpg');
+      formData.append('caption', captionText);
+      
+      const response = await fetch(TELEGRAM_API, {
+        method: 'POST',
+        body: formData as any
+      });
+
+      const data = await response.json();
+      if (!data.ok) {
+          if (data.error_code === 404) {
+              console.error(`[Telegram] Failed 404 for ${targetChatId}. Bot token might be invalid.`);
+          } else {
+              console.error(`[Telegram] Failed to send photo to ${targetChatId}:`, data);
+              // Option: Remove subscriber if blocked by user (error_code 403)
+              if (data.error_code === 403) {
+                  db.prepare('DELETE FROM telegram_subscribers WHERE chat_id = ?').run(targetChatId);
+                  console.log(`[Telegram] Removed blocked subscriber ${targetChatId}`);
+              }
+          }
+      } else {
+          console.log(`[Telegram] Ticket sent successfully to ${targetChatId}!`);
+      }
     }
   } catch (error) {
     console.error('[Telegram] Error sending ticket:', error);
@@ -432,15 +525,7 @@ async function runAutomation(taskId: string) {
             if (await fallbackPhone.isVisible()) await fallbackPhone.fill(String(phone));
         }
 
-        // 3. Fill Email (Optional)
-        if (email) {
-            if (await emailLocator.isVisible({ timeout: 2000 })) {
-                await emailLocator.fill(String(email));
-            } else {
-                const fallbackEmail = targetFrame.locator('input[placeholder*="البريد"], input[type="email"]').first();
-                if (await fallbackEmail.isVisible()) await fallbackEmail.fill(String(email));
-            }
-        }
+        // 3. Email input intentionally skipped per user request
 
         stepScreenshot = await page.screenshot({ type: 'jpeg', quality: 60 });
         broadcast(taskId, { type: 'SCREENSHOT', image: stepScreenshot.toString('base64'), caption: 'بعد إدخال البيانات الشخصية', isError: false });
@@ -804,8 +889,12 @@ async function runAutomation(taskId: string) {
                      const opts = await daySelect.locator('option').evaluateAll((os: HTMLOptionElement[]) => os.filter(o => o.value && !['', '0'].includes(o.value) && !o.textContent?.includes('اختر')).map(o => o.value));
                      if (opts.length > 0) {
                          await daySelect.selectOption(opts[0]);
+                         await daySelect.evaluate((e: HTMLSelectElement) => {
+                             e.dispatchEvent(new Event('change', { bubbles: true }));
+                             e.dispatchEvent(new Event('blur', { bubbles: true }));
+                         }).catch(()=>{});
                          broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار اليوم بنجاح.` });
-                         await page.waitForTimeout(3000); // Allow time to fetch times
+                         await page.waitForTimeout(3000); 
                      }
                  }
                  
@@ -813,6 +902,10 @@ async function runAutomation(taskId: string) {
                      const opts = await timeSelect.locator('option').evaluateAll((os: HTMLOptionElement[]) => os.filter(o => o.value && !['', '0'].includes(o.value) && !o.textContent?.includes('اختر')).map(o => o.value));
                      if (opts.length > 0) {
                          await timeSelect.selectOption(opts[0]);
+                         await timeSelect.evaluate((e: HTMLSelectElement) => {
+                             e.dispatchEvent(new Event('change', { bubbles: true }));
+                             e.dispatchEvent(new Event('blur', { bubbles: true }));
+                         }).catch(()=>{});
                          broadcast(taskId, { type: 'LOG', message: `[PROCESS] تم اختيار التوقيت بنجاح.` });
                          await page.waitForTimeout(2000);
                      }
@@ -842,18 +935,33 @@ async function runAutomation(taskId: string) {
 
         const confirmBtn = targetFrame.locator('button:has-text("تنفيذ"), #Submit_btn, input[type="submit"]').first();
         if (await confirmBtn.isVisible({ timeout: 5000 })) {
-            await confirmBtn.click({ force: true });
+            // Wait up to 5 seconds for the button to become enabled (not disabled)
+            for (let j=0; j<10; j++) {
+                const isDisabled = await confirmBtn.evaluate((el: HTMLButtonElement) => el.disabled || el.classList.contains('disabled'));
+                if (!isDisabled) break;
+                await page.waitForTimeout(500);
+            }
+            broadcast(taskId, { type: 'LOG', message: `[PROCESS] المعالجة تمت، الضغط على تنفيذ للحصول على التذكرة النهائية...` });
+            await confirmBtn.click(); // Standard click waits for actionability
         } else {
              throw new Error(`تعذر العثور على زر تأكيد الحجز النهائي بعد اختيار الموعد.`);
         }
         
         // --- Step 4 Validation ---
-        await page.waitForTimeout(4000); 
+        broadcast(taskId, { type: 'LOG', message: `[INFO] ننتظر صدور التذكرة النهائية من الموقع (قد يستغرق بعض الوقت)...` });
+        await page.waitForTimeout(5000); 
         // Re-acquire frame in case it reloaded after submission
         targetFrame = page.frames().find(f => f.name() === 'myIFrm') || page.mainFrame();
 
-        const successIndicators = targetFrame.locator('button:has-text("Download"), button:has-text("تحميل"), a:has-text("تحميل"), .download, :has-text("تعديل الحجز"), :has-text("الغاء الحجز"), .ticket, .modal-content, .alert-success').first();
-        const isSuccess = await successIndicators.isVisible({ timeout: 5000 }).catch(() => false) || await targetFrame.locator('text=Download').count() > 0 || await targetFrame.locator('text=تحميل').count() > 0;
+        // STRICT indicators mapping to the ACTUAL printed ticket. Removed .modal-content, .alert-success
+        const successIndicators = targetFrame.locator('button:has-text("Download"), button:has-text("تحميل"), a:has-text("تحميل"), .download, :has-text("تعديل الحجز"), :has-text("الغاء الحجز")').first();
+        const fallbackTicketIndicator = targetFrame.locator('text="سحب نقدي", text="برجاء التواجد بالفرع", text="15 دقيقة"').first();
+        
+        // Wait gracefully up to 15 seconds for the ticket payload to appear
+        const isSuccess = await successIndicators.isVisible({ timeout: 15000 }).catch(() => false) 
+                          || await fallbackTicketIndicator.isVisible({ timeout: 5000 }).catch(() => false);
+        
+        targetFrame = page.frames().find(f => f.name() === 'myIFrm') || page.mainFrame();
 
         if (!isSuccess) {
             // Check if there's a soft error displayed on screen
@@ -934,6 +1042,7 @@ async function runAutomation(taskId: string) {
                 };
 
                 let ticketShotBase64 = null;
+                let extractedTicketTime = null;
 
                 try {
                     // Try to find the ticket box inside the iframe first
@@ -948,15 +1057,37 @@ async function runAutomation(taskId: string) {
 
                     if (finalLocator) {
                         try {
+                            // Attempt to extract the text from the entire iframe and page to ensure no weird elements hide the text
+                            const fullContent = await page.evaluate(() => document.body.innerText).catch(() => '');
+                            const frameContent = await targetFrame.evaluate(() => document.body.innerText).catch(() => '');
+                            const combinedText = (fullContent + " " + frameContent).replace(/\s+/g, ' ');
+                            
+                            
+                            // Find all matches globally in the text
+                            const regex = /(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\s+|)\d{1,2}:\d{2}\s*(?:AM|PM|a\.m\.|p\.m\.|ص|م|am|pm)?/ig;
+                            const matches = combinedText.match(regex);
+                            
+                            // Let's grab the final match because sometimes the system prints time locally first and the REAL ticket time is loaded last.
+                            if (matches && matches.length > 0) {
+                                extractedTicketTime = matches[matches.length - 1]; // Take the LAST matched time
+                                broadcast(taskId, { type: 'LOG', message: `[DEBUG] استخراج ذكي للتوقيت من التذكرة: ${extractedTicketTime}` });
+                            } else {
+                                broadcast(taskId, { type: 'LOG', message: `[DEBUG] لم يعثر الكاشف على التوقيت. النص المستخرج كان: ${combinedText.substring(0, 50)}...` });
+                            }
+                            
+                        } catch(e) {
+                            broadcast(taskId, { type: 'LOG', message: `[DEBUG] خطأ في كاشف التوقيت: ${e.message}` });
+                        }
+
+                        try {
                             // Fetch dimensions bypassing scroll algorithms. boundingBox() automatically handles iframe offsets!
                             const box = await finalLocator.boundingBox({ timeout: 5000 });
                             
                             if (box && box.width > 0 && box.height > 0) {
-                                // Clamp the viewport to ensure the area is fully visible, but without triggering explicit scroll actions on the element
-                                ticketShotBase64 = (await page.screenshot({ 
+                                // Use the locator directly to take a screenshot - handles scrolling automatically and correctly captures the entire element and its height!
+                                ticketShotBase64 = (await finalLocator.screenshot({ 
                                     type: 'jpeg', 
-                                    quality: 60,
-                                    clip: { x: box.x, y: box.y, width: box.width, height: box.height},
+                                    quality: 80,
                                     timeout: 10000
                                 })).toString('base64');
                             } else {
@@ -981,8 +1112,14 @@ async function runAutomation(taskId: string) {
                         isTicket: true // <--- sends only the clean cropped ticket to the gallery
                     });
 
+                    // Formulate cleaner text with Phone and automatic time
+                    const phoneVal = row['الهاتف'] || row['رقم الموبايل'] || row['رقم الهاتف'] || row['Phone'] || 'غير متوفر';
+                    
+                    // prioritize ticket extracted time -> excel time -> system exact time fallback
+                    const timeVal = extractedTicketTime || row['الوقت'] || row['الميعاد'] || row['التوقيت'] || new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+                    
                     // Send to Telegram if configured
-                    sendTelegramTicket(ticketShotBase64, `✅ تم الحجز بنجاح!\nالعميل: ${nationalId}\nالفرع: ${branch || region}\nالتوقيت: ${row['الوقت'] || ''}`);
+                    sendTelegramTicket(ticketShotBase64, `✅ تم الحجز بنجاح!\nالعميل: ${nationalId}\nالهاتف: ${phoneVal}\nالفرع: ${branch || region}\nالتوقيت: ${timeVal}`);
                 } else {
                     broadcast(taskId, { type: 'LOG', message: `⚠️ لم يتم العثور على الإطار الأبيض للتذكرة لقصها!` });
                 }

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Play, Download, FileSpreadsheet, AlertCircle, CheckCircle2, Settings, Monitor, Shield, Clock, FileText, Menu, X, Info, CheckCircle, AlertTriangle, XCircle, Loader2, CreditCard, Users, Activity, RotateCcw, Ticket, FileType } from 'lucide-react';
+import { Upload, Play, Download, FileSpreadsheet, AlertCircle, CheckCircle2, Settings, Monitor, Shield, Clock, FileText, Menu, X, Info, CheckCircle, AlertTriangle, XCircle, Loader2, CreditCard, Users, Activity, RotateCcw, Ticket, FileType, Share2 } from 'lucide-react';
 import * as xlsx from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { governorates, ageGroups, generateMockClientData, categoriesMap, regionsMap } from './lib/egyptianIdGenerator';
@@ -439,6 +439,29 @@ export default function App() {
     setFile(null);
   };
 
+  const handleShare = async () => {
+    const shareData = {
+      title: 'NBE Automator Pro',
+      text: 'جرب نظام أتمتة حجز البنك الأهلي الذكي!',
+      url: window.location.href,
+    };
+
+    if (navigator.share && navigator.canShare(shareData)) {
+      try {
+        await navigator.share(shareData);
+      } catch (err) {
+        console.log('Error sharing:', err);
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+        alert('تم نسخ رابط التطبيق بنجاح!');
+      } catch (err) {
+        console.log('Error copying link:', err);
+      }
+    }
+  };
+
   return (
     <div className="flex flex-col md:flex-row h-[100dvh] w-full overflow-hidden bg-[#f4f7f6] text-slate-700 font-sans" dir="rtl">
       
@@ -555,6 +578,13 @@ export default function App() {
           </div>
           
           <div className="flex items-center justify-end gap-2 w-full sm:w-auto">
+            <button 
+              onClick={handleShare}
+              className="px-4 py-2 sm:px-3 sm:py-1.5 rounded-lg sm:rounded-md text-sm sm:text-xs font-bold bg-[#c39c43] text-white hover:bg-[#a68233] transition-colors flex items-center justify-center gap-1.5 w-full sm:w-auto"
+              title="مشاركة التطبيق"
+            >
+              <Share2 className="w-4 h-4 sm:w-3.5 sm:h-3.5" /> مشاركة
+            </button>
             <button 
               onClick={resetApp}
               className="px-4 py-2 sm:px-3 sm:py-1.5 rounded-lg sm:rounded-md text-sm sm:text-xs font-bold bg-slate-100 text-slate-700 hover:bg-slate-200 transition-colors flex items-center justify-center gap-1.5 w-full sm:w-auto"
