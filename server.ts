@@ -1,4 +1,8 @@
 import 'dotenv/config';
+
+// Force Playwright to look for browsers inside node_modules instead of the user home directory
+process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
+
 import express from 'express';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
