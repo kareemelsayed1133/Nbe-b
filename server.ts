@@ -4,6 +4,7 @@ import 'dotenv/config';
 process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
 
 import express from 'express';
+import fs from 'fs';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
 import { chromium } from 'playwright-extra';
@@ -20,7 +21,8 @@ import Database from 'better-sqlite3';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database('tasks.db');
+const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/tasks.db' : path.join(process.cwd(), 'tasks.db');
+const db = new Database(dbPath);
 db.exec(`
   CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY, 
@@ -257,6 +259,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 const sseClients = new Map();
 
 // SSE Endpoint
+
 app.get('/api/stream/:taskId', (req, res) => {
   const { taskId } = req.params;
   const task = db.prepare('SELECT status, total FROM tasks WHERE id = ?').get(taskId) as any;
@@ -268,6 +271,8 @@ app.get('/api/stream/:taskId', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders(); // ensure headers are sent
 
   if (!sseClients.has(taskId)) {
       sseClients.set(taskId, []);
@@ -280,7 +285,11 @@ app.get('/api/stream/:taskId', (req, res) => {
 
   // Keep-alive ping every 15 seconds
   const pingInterval = setInterval(() => {
-    res.write(':ping\n\n');
+    try {
+      res.write(':ping\n\n');
+    } catch (e) {
+      clearInterval(pingInterval);
+    }
   }, 15000);
 
   req.on('close', () => {
@@ -369,14 +378,48 @@ async function runAutomation(taskId: string) {
   try {
     localBroadcast({ type: 'LOG', message: '[SYSTEM] جاري استدعاء chromium.launch...' });
     
+
+    let executablePath = undefined;
+    const possiblePaths = [
+      path.resolve(process.cwd(), 'node_modules/playwright-core/.local-browsers'),
+      path.resolve(process.cwd(), 'node_modules/playwright/.local-browsers')
+    ];
+
+    for (const p of possiblePaths) {
+      if (fs.existsSync(p)) {
+        const folders = fs.readdirSync(p);
+        
+        // Prioritize full Chromium because Headless Shell lacks extension features which Stealth plugin might need
+        const chromiumFolder = folders.find(f => f.startsWith('chromium-'));
+        if (chromiumFolder) {
+           executablePath = path.join(p, chromiumFolder, 'chrome-linux', 'chrome');
+           break;
+        }
+
+        const headlessFolder = folders.find(f => f.startsWith('chromium_headless_shell-'));
+        if (headlessFolder) {
+           executablePath = path.join(p, headlessFolder, 'chrome-headless-shell-linux64', 'chrome-headless-shell');
+           break;
+        }
+      }
+    }
+    
+    if (executablePath) {
+        localBroadcast({ type: 'LOG', message: `[SYSTEM] Found local browser at ${executablePath}` });
+    }
+
     // Launch browser with a promise timeout
     const launchPromise = chromium.launch({
       headless: true,
+      executablePath: executablePath || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
+        '--js-flags=--max-old-space-size=256',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
         '--no-zygote',
         '--disable-blink-features=AutomationControlled'
       ]
@@ -393,7 +436,7 @@ async function runAutomation(taskId: string) {
     const browser = await Promise.race([launchPromise, timeoutPromise]) as any;
     localBroadcast({ type: 'LOG', message: '[SYSTEM] تم تشغيل المتصفح بنجاح، جاري تفعيل العمل المتوازي (Browser Pool)...' });
 
-    const CONCURRENCY_LIMIT = 3;
+    const CONCURRENCY_LIMIT = 1;
     let currentIndex = 0;
     let completedCount = 0;
 
@@ -1207,6 +1250,7 @@ async function runAutomation(taskId: string) {
     console.error('Automation error details:', error);
     broadcast(taskId, { type: 'LOG', message: `❌ حدث خطأ في النظام: ${error.message}` });
     db.prepare('UPDATE tasks SET status = ? WHERE id = ?').run('failed', taskId);
+    broadcast(taskId, { type: 'FAILED' });
   }
 }
 

@@ -4,13 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "start": "PLAYWRIGHT_BROWSERS_PATH=0 tsx server.ts",
+    "start": "PLAYWRIGHT_BROWSERS_PATH=0 npx tsx server.ts",
     "dev": "PLAYWRIGHT_BROWSERS_PATH=0 tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "postinstall": "PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium chromium-headless-shell"
+    "postinstall": "node install_browsers.js"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

@@ -320,6 +320,10 @@ export default function App() {
           setStatus('completed');
           setLogs(prev => [...prev, '[SUCCESS] تم الانتهاء من جميع العمليات!']);
           eventSource.close();
+        } else if (data.type === 'FAILED') {
+          setStatus('error');
+          setLogs(prev => [...prev, '[ERROR] توقفت المهمة بسبب خطأ حرج (راجع السجلات).']);
+          eventSource.close();
         }
       } catch (err: any) {
         if (err.message === 'AuthRequired') {
